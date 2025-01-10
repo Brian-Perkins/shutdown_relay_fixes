@@ -3241,11 +3241,13 @@ impl chipset_device::mmio::MmioIntercept for FallbackMmioDevice {
     fn mmio_read(&mut self, addr: u64, data: &mut [u8]) -> chipset_device::io::IoResult {
         data.fill(!0);
         if let Some(partition) = self.partition.upgrade() {
-            if self.mmio_ranges.iter().any(|range| {
-                range.contains_addr(addr) && range.contains_addr(addr + data.len() as u64 - 1)
-            }) {
-                partition.host_mmio_read(addr, data);
-            }
+            // if self.mmio_ranges.iter().any(|range| {
+            //     range.contains_addr(addr) && range.contains_addr(addr + data.len() as u64 - 1)
+            // }) {
+            partition.host_mmio_read(addr, data);
+            // } else {
+            //     tracing::warn!(addr = format!("{:x}", addr), "Ignoring read")
+            // }
         }
 
         chipset_device::io::IoResult::Ok
@@ -3253,11 +3255,13 @@ impl chipset_device::mmio::MmioIntercept for FallbackMmioDevice {
 
     fn mmio_write(&mut self, addr: u64, data: &[u8]) -> chipset_device::io::IoResult {
         if let Some(partition) = self.partition.upgrade() {
-            if self.mmio_ranges.iter().any(|range| {
-                range.contains_addr(addr) && range.contains_addr(addr + data.len() as u64 - 1)
-            }) {
-                partition.host_mmio_write(addr, data);
-            }
+            // if self.mmio_ranges.iter().any(|range| {
+            //     range.contains_addr(addr) && range.contains_addr(addr + data.len() as u64 - 1)
+            // }) {
+            partition.host_mmio_write(addr, data);
+            // } else {
+            //     tracing::warn!(addr = format!("{:x}", addr), "Ignoring write")
+            // }
         }
 
         chipset_device::io::IoResult::Ok
