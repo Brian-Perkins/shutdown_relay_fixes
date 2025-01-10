@@ -25,13 +25,8 @@ use vm_topology::memory::MemoryRangeWithNode;
 use vm_topology::processor::ProcessorTopology;
 use vmm_core::acpi_builder::AcpiTablesBuilder;
 use zerocopy::AsBytes;
-<<<<<<< HEAD
-use zerocopy::FromBytes;
-||||||| parent of df0f18ba (swap bdf)
-=======
 use zerocopy::FromBytes;
 use zerocopy::Ref;
->>>>>>> df0f18ba (swap bdf)
 
 pub mod vtl0_config;
 pub mod vtl2_config;
