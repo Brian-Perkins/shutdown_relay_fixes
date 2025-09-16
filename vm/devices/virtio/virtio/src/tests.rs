@@ -1774,3 +1774,73 @@ async fn verify_device_multi_queue_pci(driver: DefaultDriver) {
         .unwrap();
     drop(dev);
 }
+
+#[async_test]
+async fn verify_device_packed_queue_simple(driver: DefaultDriver) {
+    let test_mem = VirtioTestMemoryAccess::new();
+    let doorbell_registration: Arc<dyn DoorbellRegistration> = test_mem.clone();
+    let mut guest = VirtioTestGuest::new(&driver, &test_mem, 1, 2, true);
+    let mem = guest.mem();
+    let features = VirtioDeviceFeatures::new()
+        .with_bank0(VirtioDeviceFeaturesBank0::new().with_ring_event_idx(true))
+        .with_bank1(
+            VirtioDeviceFeaturesBank1::new()
+                .with_version_1(true)
+                .with_ring_packed(true),
+        );
+    let target = TestLineInterruptTarget::new_arc();
+    let interrupt = LineInterrupt::new_with_target("test", target.clone(), 0);
+    let base_addr = guest.get_queue_descriptor_backing_memory_address(0);
+    let queue_work = Arc::new(move |_: u16, mut work: VirtioQueueCallbackWork| {
+        assert_eq!(work.payload.len(), 1);
+        assert_eq!(work.payload[0].address, base_addr);
+        assert_eq!(work.payload[0].length, 0x1000);
+        work.complete(123);
+    });
+    let mut dev = VirtioMmioDevice::new(
+        Box::new(LegacyWrapper::new(
+            &VmTaskDriverSource::new(SingleDriverBackend::new(driver)),
+            TestDevice::new(
+                DeviceTraits {
+                    device_id: 3,
+                    device_features: features.clone(),
+                    max_queues: 1,
+                    device_register_length: 0,
+                    ..Default::default()
+                },
+                Some(queue_work),
+            ),
+            &mem,
+        )),
+        interrupt,
+        Some(doorbell_registration),
+        0,
+        1,
+    );
+
+    guest.setup_chipset_device(&mut dev, features);
+    expect_mmio_interrupt(
+        &mut dev,
+        &target,
+        VIRTIO_MMIO_INTERRUPT_STATUS_CONFIG_CHANGE,
+        false,
+    )
+    .await;
+    guest.add_to_avail_queue(0);
+    // notify device
+    dev.write_u32(80, 0);
+    expect_mmio_interrupt(
+        &mut dev,
+        &target,
+        VIRTIO_MMIO_INTERRUPT_STATUS_USED_BUFFER,
+        false,
+    )
+    .await;
+    let (desc, len) = guest.get_next_completed(0).unwrap();
+    assert_eq!(desc, 0u16);
+    assert_eq!(len, 123);
+    assert_eq!(guest.get_next_completed(0).is_none(), true);
+    // reset the device
+    dev.write_u32(112, 0);
+    drop(dev);
+}

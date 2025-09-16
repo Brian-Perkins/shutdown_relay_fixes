@@ -16,7 +16,9 @@ vm_resource.workspace = true
 
 anyhow.workspace = true
 async-trait.workspace = true
+bitfield-struct.workspace = true
 tracing.workspace = true
+zerocopy.workspace = true
 
 [lints]
 workspace = true
