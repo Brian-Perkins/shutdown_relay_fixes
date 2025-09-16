@@ -8593,12 +8593,14 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bitfield-struct 0.11.0",
  "guestmem",
  "plan9",
  "tracing",
  "virtio",
  "virtio_resources",
  "vm_resource",
+ "zerocopy 0.8.25",
 ]
 
 [[package]]
@@ -8635,10 +8637,12 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bitfield-struct 0.11.0",
  "guestmem",
  "parking_lot",
  "tracing",
  "virtio",
+ "zerocopy 0.8.25",
 ]
 
 [[package]]

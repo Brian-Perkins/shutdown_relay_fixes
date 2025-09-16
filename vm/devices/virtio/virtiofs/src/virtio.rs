@@ -21,6 +21,7 @@ use virtio::VirtioQueueCallbackWork;
 use virtio::VirtioQueueState;
 use virtio::VirtioQueueWorker;
 use virtio::VirtioQueueWorkerContext;
+use virtio::spec::VirtioDeviceFeatures;
 use vmcore::vm_task::VmTaskDriver;
 use vmcore::vm_task::VmTaskDriverSource;
 use zerocopy::Immutable;
@@ -97,7 +98,7 @@ impl VirtioDevice for VirtioFsDevice {
     fn traits(&self) -> DeviceTraits {
         DeviceTraits {
             device_id: VIRTIO_DEVICE_TYPE_FS,
-            device_features: 0,
+            device_features: VirtioDeviceFeatures::default(),
             max_queues: 2,
             device_register_length: self.config.as_bytes().len() as u32,
             shared_memory: DeviceTraitsSharedMemory {

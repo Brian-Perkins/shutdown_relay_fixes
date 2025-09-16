@@ -35,14 +35,14 @@ pub struct VirtioMmioDevice {
     device: Box<dyn VirtioDevice>,
     device_id: u32,
     vendor_id: u32,
-    device_feature: [u32; 2],
+    device_feature: VirtioDeviceFeatures,
     device_feature_select: u32,
-    driver_feature: [u32; 2],
+    driver_feature: VirtioDeviceFeatures,
     driver_feature_select: u32,
     queue_select: u32,
     events: Vec<pal_event::Event>,
     queues: Vec<QueueParams>,
-    device_status: u32,
+    device_status: VirtioDeviceStatus,
     config_generation: u32,
     doorbells: VirtioDoorbells,
     interrupt_state: Arc<Mutex<InterruptState>>,
@@ -105,19 +105,21 @@ impl VirtioMmioDevice {
             device,
             device_id: traits.device_id as u32,
             vendor_id: 0x1af4,
-            device_feature: [
-                traits.device_features as u32
-                    | VIRTIO_F_RING_EVENT_IDX
-                    | VIRTIO_F_RING_INDIRECT_DESC,
-                (traits.device_features >> 32) as u32 | VIRTIO_F_VERSION_1,
-            ],
+            device_feature: VirtioDeviceFeatures {
+                bank0: traits
+                    .device_features
+                    .bank0
+                    .with_ring_event_idx(true)
+                    .with_ring_indirect_desc(true),
+                bank1: traits.device_features.bank1.with_version_1(true),
+            },
             device_feature_select: 0,
-            driver_feature: [0; 2],
+            driver_feature: VirtioDeviceFeatures::default(),
             driver_feature_select: 0,
             queue_select: 0,
             events,
             queues,
-            device_status: 0,
+            device_status: VirtioDeviceStatus::new(),
             config_generation: 0,
             doorbells: VirtioDoorbells::new(doorbell_registration),
             interrupt_state,
@@ -126,7 +128,7 @@ impl VirtioMmioDevice {
 
     fn update_config_generation(&mut self) {
         self.config_generation = self.config_generation.wrapping_add(1);
-        if self.device_status & VIRTIO_DRIVER_OK != 0 {
+        if self.device_status.driver_ok() {
             self.interrupt_state
                 .lock()
                 .update(true, VIRTIO_MMIO_INTERRUPT_STATUS_CONFIG_CHANGE);
@@ -156,8 +158,10 @@ impl VirtioMmioDevice {
             // Device feature bank
             16 => {
                 let feature_select = self.device_feature_select as usize;
-                if feature_select < self.device_feature.len() {
-                    self.device_feature[feature_select]
+                if feature_select == 0 {
+                    self.device_feature.bank0.into()
+                } else if feature_select == 1 {
+                    self.device_feature.bank1.into()
                 } else {
                     0
                 }
@@ -170,8 +174,10 @@ impl VirtioMmioDevice {
             // Driver feature bank
             32 => {
                 let feature_select = self.driver_feature_select as usize;
-                if feature_select < self.driver_feature.len() {
-                    self.driver_feature[feature_select]
+                if feature_select == 0 {
+                    self.driver_feature.bank0.into()
+                } else if feature_select == 1 {
+                    self.driver_feature.bank1.into()
                 } else {
                     0
                 }
@@ -233,8 +239,7 @@ impl VirtioMmioDevice {
             // 8-byte padding
             //
             // Device status
-            112 => self.device_status,
-            //
+            112 => self.device_status.as_u32(),
             // 12-byte padding
             //
             // Queue descriptor table address (low part)
@@ -307,16 +312,24 @@ impl VirtioMmioDevice {
         let offset = (address & 0xfff) as u16;
         assert!(offset & 3 == 0);
         let queue_select = self.queue_select as usize;
-        let queues_locked = self.device_status & VIRTIO_DRIVER_OK != 0;
-        let features_locked = queues_locked || self.device_status & VIRTIO_FEATURES_OK != 0;
+        let queues_locked = self.device_status.driver_ok();
+        let features_locked = queues_locked || self.device_status.features_ok();
         match offset {
             // Device feature bank index
             20 => self.device_feature_select = val,
             // Driver feature bank
             32 => {
                 let bank = self.driver_feature_select as usize;
-                if !features_locked && bank < self.driver_feature.len() {
-                    self.driver_feature[bank] = val & self.device_feature[bank];
+                if features_locked {
+                    // No updates allowed.
+                } else if bank == 0 {
+                    self.driver_feature.bank0 = VirtioDeviceFeaturesBank0::from(
+                        val & self.device_feature.bank0.into_bits(),
+                    );
+                } else if bank == 1 {
+                    self.driver_feature.bank1 = VirtioDeviceFeaturesBank1::from(
+                        val & self.device_feature.bank1.into_bits(),
+                    );
                 }
             }
             // Driver feature bank index
@@ -355,8 +368,8 @@ impl VirtioMmioDevice {
             // Device status
             112 => {
                 if val == 0 {
-                    let started = (self.device_status & VIRTIO_DRIVER_OK) != 0;
-                    self.device_status = 0;
+                    let started = self.device_status.driver_ok();
+                    self.device_status = VirtioDeviceStatus::new();
                     self.config_generation = 0;
                     if started {
                         self.doorbells.clear();
@@ -365,17 +378,23 @@ impl VirtioMmioDevice {
                     self.interrupt_state.lock().update(false, !0);
                 }
 
-                self.device_status |= val & (VIRTIO_ACKNOWLEDGE | VIRTIO_DRIVER | VIRTIO_FAILED);
+                let new_status = VirtioDeviceStatus::from(val as u8);
+                if new_status.acknowledge() {
+                    self.device_status.set_acknowledge(true);
+                }
+                if new_status.driver() {
+                    self.device_status.set_driver(true);
+                }
+                if new_status.failed() {
+                    self.device_status.set_failed(true);
+                }
 
-                if self.device_status & VIRTIO_FEATURES_OK == 0 && val & VIRTIO_FEATURES_OK != 0 {
-                    self.device_status |= VIRTIO_FEATURES_OK;
+                if !self.device_status.features_ok() && new_status.features_ok() {
+                    self.device_status.set_features_ok(true);
                     self.update_config_generation();
                 }
 
-                if self.device_status & VIRTIO_DRIVER_OK == 0 && val & VIRTIO_DRIVER_OK != 0 {
-                    let features =
-                        ((self.driver_feature[1] as u64) << 32) | self.driver_feature[0] as u64;
-
+                if !self.device_status.driver_ok() && new_status.driver_ok() {
                     let notification_address = (address & !0xfff) + 80;
                     for i in 0..self.events.len() {
                         self.doorbells.add(
@@ -405,13 +424,13 @@ impl VirtioMmioDevice {
                         .collect();
 
                     self.device.enable(Resources {
-                        features,
+                        features: self.driver_feature,
                         queues,
                         shared_memory_region: None,
                         shared_memory_size: 0,
                     });
 
-                    self.device_status |= VIRTIO_DRIVER_OK;
+                    self.device_status.set_driver_ok(true);
                     self.update_config_generation();
                 }
             }

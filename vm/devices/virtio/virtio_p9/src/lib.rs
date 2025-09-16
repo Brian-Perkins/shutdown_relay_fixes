@@ -8,6 +8,7 @@
 pub mod resolver;
 
 use async_trait::async_trait;
+use bitfield_struct::bitfield;
 use guestmem::GuestMemory;
 use plan9::Plan9FileSystem;
 use std::sync::Arc;
@@ -16,10 +17,24 @@ use virtio::LegacyVirtioDevice;
 use virtio::VirtioQueueCallbackWork;
 use virtio::VirtioQueueWorkerContext;
 use virtio::VirtioState;
+use virtio::spec::VirtioDeviceFeatures;
+use virtio::spec::VirtioDeviceFeaturesBank0;
+use zerocopy::FromBytes;
+use zerocopy::Immutable;
+use zerocopy::IntoBytes;
+use zerocopy::KnownLayout;
 
 const VIRTIO_DEVICE_TYPE_9P_TRANSPORT: u16 = 9;
 
-const VIRTIO_9P_F_MOUNT_TAG: u64 = 1;
+#[bitfield(u32)]
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct VirtioDeviceFeaturesPlan9Flags {
+    pub mount_tag: bool, // VIRTIO_9P_F_MOUNT_TAG
+    #[bits(23)]
+    _reserved: u32,
+    #[bits(8)]
+    _unavailable: u8,
+}
 
 pub struct VirtioPlan9Device {
     fs: Arc<Plan9FileSystem>,
@@ -56,7 +71,14 @@ impl LegacyVirtioDevice for VirtioPlan9Device {
     fn traits(&self) -> DeviceTraits {
         DeviceTraits {
             device_id: VIRTIO_DEVICE_TYPE_9P_TRANSPORT,
-            device_features: VIRTIO_9P_F_MOUNT_TAG,
+            device_features: VirtioDeviceFeatures {
+                bank0: VirtioDeviceFeaturesBank0::new().with_device_specific(
+                    VirtioDeviceFeaturesPlan9Flags::new()
+                        .with_mount_tag(true)
+                        .into(),
+                ),
+                ..Default::default()
+            },
             max_queues: 1,
             device_register_length: self.tag.len() as u32,
             ..Default::default()
