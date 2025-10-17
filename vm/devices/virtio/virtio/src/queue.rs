@@ -80,7 +80,7 @@ impl QueueCore {
             queue_desc,
             queue_avail,
             queue_used,
-            use_ring_event_index: features.bank0.ring_event_idx(),
+            use_ring_event_index: features.bank0().ring_event_idx(),
             mem,
         })
     }

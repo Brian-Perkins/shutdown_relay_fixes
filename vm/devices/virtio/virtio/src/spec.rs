@@ -53,10 +53,50 @@ pub struct VirtioDeviceFeaturesBank1 {
     pub device_specific: u16,
 }
 
-#[derive(Default, Debug, Copy, Clone)]
-pub struct VirtioDeviceFeatures {
-    pub bank0: VirtioDeviceFeaturesBank0,
-    pub bank1: VirtioDeviceFeaturesBank1,
+#[derive(Debug, Clone)]
+pub struct VirtioDeviceFeatures(Vec<u32>);
+impl VirtioDeviceFeatures {
+    pub fn new() -> Self {
+        Self(Vec::with_capacity(2))
+    }
+
+    pub fn set_bank(&mut self, index: usize, val: u32) {
+        if self.0.len() <= index {
+            self.0.resize(index + 1, 0);
+        }
+        self.0[index] = val;
+    }
+
+    pub fn with_bank(mut self, index: usize, val: u32) -> Self {
+        self.set_bank(index, val);
+        self
+    }
+
+    pub fn with_bank0(self, bank0: VirtioDeviceFeaturesBank0) -> Self {
+        self.with_bank(0, bank0.into_bits())
+    }
+
+    pub fn with_bank1(self, bank1: VirtioDeviceFeaturesBank1) -> Self {
+        self.with_bank(1, bank1.into_bits())
+    }
+
+    pub fn bank(&self, index: usize) -> u32 {
+        self.0.get(index).map_or(0, |x| *x)
+    }
+
+    pub fn bank0(&self) -> VirtioDeviceFeaturesBank0 {
+        VirtioDeviceFeaturesBank0::from_bits(self.bank(0))
+    }
+
+    pub fn bank1(&self) -> VirtioDeviceFeaturesBank1 {
+        VirtioDeviceFeaturesBank1::from_bits(self.bank(1))
+    }
+}
+
+impl Default for VirtioDeviceFeatures {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[bitfield(u8)]

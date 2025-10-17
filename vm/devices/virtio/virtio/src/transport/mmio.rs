@@ -105,16 +105,17 @@ impl VirtioMmioDevice {
             device,
             device_id: traits.device_id as u32,
             vendor_id: 0x1af4,
-            device_feature: VirtioDeviceFeatures {
-                bank0: traits
-                    .device_features
-                    .bank0
-                    .with_ring_event_idx(true)
-                    .with_ring_indirect_desc(true),
-                bank1: traits.device_features.bank1.with_version_1(true),
-            },
+            device_feature: VirtioDeviceFeatures::new()
+                .with_bank0(
+                    traits
+                        .device_features
+                        .bank0()
+                        .with_ring_event_idx(true)
+                        .with_ring_indirect_desc(true),
+                )
+                .with_bank1(traits.device_features.bank1().with_version_1(true)),
             device_feature_select: 0,
-            driver_feature: VirtioDeviceFeatures::default(),
+            driver_feature: VirtioDeviceFeatures::new(),
             driver_feature_select: 0,
             queue_select: 0,
             events,
@@ -158,13 +159,7 @@ impl VirtioMmioDevice {
             // Device feature bank
             16 => {
                 let feature_select = self.device_feature_select as usize;
-                if feature_select == 0 {
-                    self.device_feature.bank0.into()
-                } else if feature_select == 1 {
-                    self.device_feature.bank1.into()
-                } else {
-                    0
-                }
+                self.device_feature.bank(feature_select)
             }
             // Device feature bank index
             20 => self.device_feature_select,
@@ -174,13 +169,7 @@ impl VirtioMmioDevice {
             // Driver feature bank
             32 => {
                 let feature_select = self.driver_feature_select as usize;
-                if feature_select == 0 {
-                    self.driver_feature.bank0.into()
-                } else if feature_select == 1 {
-                    self.driver_feature.bank1.into()
-                } else {
-                    0
-                }
+                self.driver_feature.bank(feature_select)
             }
             // Driver feature bank index
             36 => self.driver_feature_select,
@@ -320,16 +309,11 @@ impl VirtioMmioDevice {
             // Driver feature bank
             32 => {
                 let bank = self.driver_feature_select as usize;
-                if features_locked {
+                if features_locked || bank > 3 {
                     // No updates allowed.
-                } else if bank == 0 {
-                    self.driver_feature.bank0 = VirtioDeviceFeaturesBank0::from(
-                        val & self.device_feature.bank0.into_bits(),
-                    );
-                } else if bank == 1 {
-                    self.driver_feature.bank1 = VirtioDeviceFeaturesBank1::from(
-                        val & self.device_feature.bank1.into_bits(),
-                    );
+                } else {
+                    self.driver_feature
+                        .set_bank(bank, val & self.device_feature.bank(bank));
                 }
             }
             // Driver feature bank index
@@ -424,7 +408,7 @@ impl VirtioMmioDevice {
                         .collect();
 
                     self.device.enable(Resources {
-                        features: self.driver_feature,
+                        features: self.driver_feature.clone(),
                         queues,
                         shared_memory_region: None,
                         shared_memory_size: 0,

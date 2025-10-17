@@ -70,7 +70,7 @@ impl VirtioDevice for Device {
     fn traits(&self) -> DeviceTraits {
         DeviceTraits {
             device_id: 27,
-            device_features: VirtioDeviceFeatures::default(),
+            device_features: VirtioDeviceFeatures::new(),
             max_queues: 1,
             device_register_length: size_of::<PmemConfig>() as u32,
             shared_memory: DeviceTraitsSharedMemory {

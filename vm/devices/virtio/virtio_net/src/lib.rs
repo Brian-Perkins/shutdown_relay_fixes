@@ -229,11 +229,10 @@ impl VirtioDevice for Device {
         // TODO: Add network features based on endpoint capabilities (NetworkFeatures::VIRTIO_NET_F_*)
         DeviceTraits {
             device_id: 1,
-            device_features: VirtioDeviceFeatures {
-                bank0: VirtioDeviceFeaturesBank0::new()
+            device_features: VirtioDeviceFeatures::new().with_bank0(
+                VirtioDeviceFeaturesBank0::new()
                     .with_device_specific(NetworkFeaturesBank0::new().with_mac(true).into()),
-                ..Default::default()
-            },
+            ),
             max_queues: 2 * self.registers.max_virtqueue_pairs,
             device_register_length: size_of::<NetConfig>() as u32,
             shared_memory: DeviceTraitsSharedMemory { id: 0, size: 0 },
@@ -282,7 +281,7 @@ impl VirtioDevice for Device {
                 continue;
             }
             let rx_queue = VirtioQueue::new(
-                resources.features,
+                resources.features.clone(),
                 rx_resources.params,
                 self.memory.clone(),
                 rx_resources.notify,
@@ -306,7 +305,7 @@ impl VirtioDevice for Device {
                 continue;
             }
             let tx_queue = VirtioQueue::new(
-                resources.features,
+                resources.features.clone(),
                 tx_resources.params,
                 self.memory.clone(),
                 tx_resources.notify,

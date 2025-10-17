@@ -468,7 +468,7 @@ pub struct DeviceTraitsSharedMemory {
     pub size: u64,
 }
 
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct DeviceTraits {
     pub device_id: u16,
     pub device_features: VirtioDeviceFeatures,
@@ -542,7 +542,7 @@ impl<T: LegacyVirtioDevice> VirtioDevice for LegacyWrapper<T> {
 
     fn enable(&mut self, resources: Resources) {
         let running_state = VirtioRunningState {
-            features: resources.features,
+            features: resources.features.clone(),
             enabled_queues: resources
                 .queues
                 .iter()
@@ -567,7 +567,7 @@ impl<T: LegacyVirtioDevice> VirtioDevice for LegacyWrapper<T> {
                 Some(worker.into_running_task(
                     "virtio-queue".to_string(),
                     self.mem.clone(),
-                    resources.features,
+                    resources.features.clone(),
                     queue_resources,
                     self.exit_event.listen(),
                 ))

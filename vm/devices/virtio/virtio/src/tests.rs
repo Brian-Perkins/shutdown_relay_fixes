@@ -310,10 +310,9 @@ impl VirtioTestGuest {
     }
 
     fn queue_features(&self) -> VirtioDeviceFeatures {
-        VirtioDeviceFeatures {
-            bank0: VirtioDeviceFeaturesBank0::new().with_ring_event_idx(self.use_ring_event_index),
-            ..Default::default()
-        }
+        VirtioDeviceFeatures::new().with_bank0(
+            VirtioDeviceFeaturesBank0::new().with_ring_event_idx(self.use_ring_event_index),
+        )
     }
 
     fn queue_params(&self, i: u16) -> QueueParams {
@@ -357,9 +356,9 @@ impl VirtioTestGuest {
         );
         dev.write_u32(112, VirtioDeviceStatus::new().with_driver(true).as_u32());
         dev.write_u32(36, 0);
-        dev.write_u32(32, driver_features.bank0.into());
+        dev.write_u32(32, driver_features.bank(0));
         dev.write_u32(36, 1);
-        dev.write_u32(32, driver_features.bank1.into());
+        dev.write_u32(32, driver_features.bank(1));
         dev.write_u32(
             112,
             VirtioDeviceStatus::new().with_features_ok(true).as_u32(),
@@ -423,9 +422,9 @@ impl VirtioTestGuest {
             .mmio_write(bar_address1 + 20, device_status.as_bytes())
             .unwrap();
         dev.write_u32(bar_address1 + 8, 0);
-        dev.write_u32(bar_address1 + 12, driver_features.bank0.into());
+        dev.write_u32(bar_address1 + 12, driver_features.bank(0));
         dev.write_u32(bar_address1 + 8, 1);
-        dev.write_u32(bar_address1 + 12, driver_features.bank1.into());
+        dev.write_u32(bar_address1 + 12, driver_features.bank(1));
         device_status = VirtioDeviceStatus::new().with_features_ok(true);
         dev.pci_device
             .mmio_write(bar_address1 + 20, device_status.as_bytes())
@@ -768,7 +767,7 @@ impl TestDevice {
 
 impl LegacyVirtioDevice for TestDevice {
     fn traits(&self) -> DeviceTraits {
-        self.traits
+        self.traits.clone()
     }
 
     fn read_registers_u32(&self, _offset: u16) -> u32 {
@@ -826,10 +825,8 @@ impl VirtioPciTestDevice {
                 TestDevice::new(
                     DeviceTraits {
                         device_id: 3,
-                        device_features: VirtioDeviceFeatures {
-                            bank0: VirtioDeviceFeaturesBank0::new().with_device_specific(2),
-                            ..Default::default()
-                        },
+                        device_features: VirtioDeviceFeatures::new()
+                            .with_bank0(VirtioDeviceFeaturesBank0::new().with_device_specific(2)),
                         max_queues: num_queues,
                         device_register_length: 12,
                         ..Default::default()
@@ -880,10 +877,8 @@ async fn verify_chipset_config(driver: DefaultDriver) {
             TestDevice::new(
                 DeviceTraits {
                     device_id: 3,
-                    device_features: VirtioDeviceFeatures {
-                        bank0: VirtioDeviceFeaturesBank0::new().with_device_specific(2),
-                        ..Default::default()
-                    },
+                    device_features: VirtioDeviceFeatures::new()
+                        .with_bank0(VirtioDeviceFeaturesBank0::new().with_device_specific(2)),
                     max_queues: 1,
                     device_register_length: 0,
                     ..Default::default()
@@ -1628,10 +1623,9 @@ async fn verify_device_queue_simple(driver: DefaultDriver) {
     let doorbell_registration: Arc<dyn DoorbellRegistration> = test_mem.clone();
     let mut guest = VirtioTestGuest::new(&driver, &test_mem, 1, 2, true);
     let mem = guest.mem();
-    let features = VirtioDeviceFeatures {
-        bank0: VirtioDeviceFeaturesBank0::new().with_ring_event_idx(true),
-        bank1: VirtioDeviceFeaturesBank1::new().with_version_1(true),
-    };
+    let features = VirtioDeviceFeatures::new()
+        .with_bank0(VirtioDeviceFeaturesBank0::new().with_ring_event_idx(true))
+        .with_bank1(VirtioDeviceFeaturesBank1::new().with_version_1(true));
     let target = TestLineInterruptTarget::new_arc();
     let interrupt = LineInterrupt::new_with_target("test", target.clone(), 0);
     let base_addr = guest.get_queue_descriptor_backing_memory_address(0);
@@ -1647,7 +1641,7 @@ async fn verify_device_queue_simple(driver: DefaultDriver) {
             TestDevice::new(
                 DeviceTraits {
                     device_id: 3,
-                    device_features: features,
+                    device_features: features.clone(),
                     max_queues: 1,
                     device_register_length: 0,
                     ..Default::default()
@@ -1696,12 +1690,13 @@ async fn verify_device_multi_queue(driver: DefaultDriver) {
     let doorbell_registration: Arc<dyn DoorbellRegistration> = test_mem.clone();
     let mut guest = VirtioTestGuest::new(&driver, &test_mem, num_queues, 2, true);
     let mem = guest.mem();
-    let features = VirtioDeviceFeatures {
-        bank0: VirtioDeviceFeaturesBank0::new()
-            .with_device_specific(2)
-            .with_ring_event_idx(true),
-        bank1: VirtioDeviceFeaturesBank1::new().with_version_1(true),
-    };
+    let features = VirtioDeviceFeatures::new()
+        .with_bank0(
+            VirtioDeviceFeaturesBank0::new()
+                .with_device_specific(2)
+                .with_ring_event_idx(true),
+        )
+        .with_bank1(VirtioDeviceFeaturesBank1::new().with_version_1(true));
     let target = TestLineInterruptTarget::new_arc();
     let interrupt = LineInterrupt::new_with_target("test", target.clone(), 0);
     let base_addr: Vec<_> = (0..num_queues)
@@ -1719,7 +1714,7 @@ async fn verify_device_multi_queue(driver: DefaultDriver) {
             TestDevice::new(
                 DeviceTraits {
                     device_id: 3,
-                    device_features: features,
+                    device_features: features.clone(),
                     max_queues: num_queues + 1,
                     device_register_length: 0,
                     ..Default::default()
@@ -1777,12 +1772,13 @@ async fn verify_device_multi_queue_pci(driver: DefaultDriver) {
     let num_queues = 5;
     let test_mem = VirtioTestMemoryAccess::new();
     let mut guest = VirtioTestGuest::new(&driver, &test_mem, num_queues, 2, true);
-    let features = VirtioDeviceFeatures {
-        bank0: VirtioDeviceFeaturesBank0::new()
-            .with_device_specific(2)
-            .with_ring_event_idx(true),
-        bank1: VirtioDeviceFeaturesBank1::new().with_version_1(true),
-    };
+    let features = VirtioDeviceFeatures::new()
+        .with_bank0(
+            VirtioDeviceFeaturesBank0::new()
+                .with_device_specific(2)
+                .with_ring_event_idx(true),
+        )
+        .with_bank1(VirtioDeviceFeaturesBank1::new().with_version_1(true));
     let base_addr: Vec<_> = (0..num_queues)
         .map(|i| guest.get_queue_descriptor_backing_memory_address(i))
         .collect();
@@ -1843,12 +1839,13 @@ async fn verify_device_packed_queue_simple(driver: DefaultDriver) {
     let doorbell_registration: Arc<dyn DoorbellRegistration> = test_mem.clone();
     let mut guest = VirtioTestGuest::new(&driver, &test_mem, 1, 2, true);
     let mem = guest.mem();
-    let features = VirtioDeviceFeatures {
-        bank0: VirtioDeviceFeaturesBank0::new().with_ring_event_idx(true),
-        bank1: VirtioDeviceFeaturesBank1::new()
-            .with_version_1(true)
-            .with_ring_packed(true),
-    };
+    let features = VirtioDeviceFeatures::new()
+        .with_bank0(VirtioDeviceFeaturesBank0::new().with_ring_event_idx(true))
+        .with_bank1(
+            VirtioDeviceFeaturesBank1::new()
+                .with_version_1(true)
+                .with_ring_packed(true),
+        );
     let target = TestLineInterruptTarget::new_arc();
     let interrupt = LineInterrupt::new_with_target("test", target.clone(), 0);
     let base_addr = guest.get_queue_descriptor_backing_memory_address(0);
@@ -1864,7 +1861,7 @@ async fn verify_device_packed_queue_simple(driver: DefaultDriver) {
             TestDevice::new(
                 DeviceTraits {
                     device_id: 3,
-                    device_features: features,
+                    device_features: features.clone(),
                     max_queues: 1,
                     device_register_length: 0,
                     ..Default::default()

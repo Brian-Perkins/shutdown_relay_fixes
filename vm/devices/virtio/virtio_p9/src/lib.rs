@@ -71,14 +71,13 @@ impl LegacyVirtioDevice for VirtioPlan9Device {
     fn traits(&self) -> DeviceTraits {
         DeviceTraits {
             device_id: VIRTIO_DEVICE_TYPE_9P_TRANSPORT,
-            device_features: VirtioDeviceFeatures {
-                bank0: VirtioDeviceFeaturesBank0::new().with_device_specific(
+            device_features: VirtioDeviceFeatures::new().with_bank0(
+                VirtioDeviceFeaturesBank0::new().with_device_specific(
                     VirtioDeviceFeaturesPlan9Flags::new()
                         .with_mount_tag(true)
-                        .into(),
+                        .into_bits(),
                 ),
-                ..Default::default()
-            },
+            ),
             max_queues: 1,
             device_register_length: self.tag.len() as u32,
             ..Default::default()

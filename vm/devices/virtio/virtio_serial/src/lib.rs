@@ -532,14 +532,13 @@ impl SerialIo {
 impl LegacyVirtioDevice for VirtioSerialDevice {
     fn traits(&self) -> DeviceTraits {
         let queue_size = 2 + 2 * self.config.max_ports;
-        let features = VirtioDeviceFeatures {
-            bank0: VirtioDeviceFeaturesBank0::new().with_device_specific(
+        let features = VirtioDeviceFeatures::new().with_bank0(
+            VirtioDeviceFeaturesBank0::new().with_device_specific(
                 VirtioDeviceFeaturesConsoleFlags::new()
                     .with_multiport(self.config.max_ports > 1)
                     .into(),
             ),
-            ..Default::default()
-        };
+        );
         DeviceTraits {
             device_id: VIRTIO_DEVICE_TYPE_CONSOLE,
             device_features: features,
@@ -585,7 +584,7 @@ impl LegacyVirtioDevice for VirtioSerialDevice {
             // if multi-port is set, start the control port thread
             VirtioState::Running(run_state) => {
                 let features = VirtioDeviceFeaturesConsoleFlags::from(
-                    run_state.features.bank0.device_specific(),
+                    run_state.features.bank0().device_specific(),
                 );
                 if features.multiport() {
                     let enabled_queues = run_state.enabled_queues.clone();
