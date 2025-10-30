@@ -30,6 +30,7 @@ bitfield-struct.workspace = true
 event-listener.workspace = true
 futures.workspace = true
 parking_lot.workspace = true
+static_assertions.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 zerocopy.workspace = true

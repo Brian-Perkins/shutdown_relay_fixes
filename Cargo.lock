@@ -8684,6 +8684,7 @@ dependencies = [
  "parking_lot",
  "pci_core",
  "pci_resources",
+ "static_assertions",
  "task_control",
  "test_with_tracing",
  "thiserror 2.0.16",

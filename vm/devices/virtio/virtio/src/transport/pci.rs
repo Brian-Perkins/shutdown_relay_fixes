@@ -220,7 +220,13 @@ impl VirtioPciDevice {
                         .with_ring_event_idx(true)
                         .with_ring_indirect_desc(true),
                 )
-                .with_bank1(traits.device_features.bank1().with_version_1(true)),
+                .with_bank1(
+                    traits
+                        .device_features
+                        .bank1()
+                        .with_version_1(true)
+                        .with_ring_packed(true),
+                ),
             device_feature_select: 0,
             driver_feature: VirtioDeviceFeatures::new(),
             driver_feature_select: 0,
@@ -628,7 +634,9 @@ impl SaveRestore for VirtioPciDevice {
 impl MmioIntercept for VirtioPciDevice {
     fn mmio_read(&mut self, address: u64, data: &mut [u8]) -> IoResult {
         if let Some((bar, offset)) = self.config_space.find_bar(address) {
-            read_as_u32_chunks(offset, data, |offset| self.read_bar_u32(bar, offset))
+            read_as_u32_chunks(offset, data, |offset| {
+                u32::to_le(self.read_bar_u32(bar, offset))
+            })
         }
         IoResult::Ok
     }
@@ -637,10 +645,10 @@ impl MmioIntercept for VirtioPciDevice {
         if let Some((bar, offset)) = self.config_space.find_bar(address) {
             write_as_u32_chunks(offset, data, |offset, request_type| match request_type {
                 ReadWriteRequestType::Write(value) => {
-                    self.write_bar_u32(address, bar, offset, value);
+                    self.write_bar_u32(address, bar, offset, u32::from_le(value));
                     None
                 }
-                ReadWriteRequestType::Read => Some(self.read_bar_u32(bar, offset)),
+                ReadWriteRequestType::Read => Some(u32::to_le(self.read_bar_u32(bar, offset))),
             })
         }
         IoResult::Ok

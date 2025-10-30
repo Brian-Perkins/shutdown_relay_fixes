@@ -113,7 +113,13 @@ impl VirtioMmioDevice {
                         .with_ring_event_idx(true)
                         .with_ring_indirect_desc(true),
                 )
-                .with_bank1(traits.device_features.bank1().with_version_1(true)),
+                .with_bank1(
+                    traits
+                        .device_features
+                        .bank1()
+                        .with_version_1(true)
+                        .with_ring_packed(true),
+                ),
             device_feature_select: 0,
             driver_feature: VirtioDeviceFeatures::new(),
             driver_feature_select: 0,
@@ -496,17 +502,17 @@ impl SaveRestore for VirtioMmioDevice {
 
 impl MmioIntercept for VirtioMmioDevice {
     fn mmio_read(&mut self, address: u64, data: &mut [u8]) -> IoResult {
-        read_as_u32_chunks(address, data, |address| self.read_u32(address));
+        read_as_u32_chunks(address, data, |address| u32::to_le(self.read_u32(address)));
         IoResult::Ok
     }
 
     fn mmio_write(&mut self, address: u64, data: &[u8]) -> IoResult {
         write_as_u32_chunks(address, data, |address, request_type| match request_type {
             ReadWriteRequestType::Write(value) => {
-                self.write_u32(address, value);
+                self.write_u32(address, u32::from_le(value));
                 None
             }
-            ReadWriteRequestType::Read => Some(self.read_u32(address)),
+            ReadWriteRequestType::Read => Some(u32::to_le(self.read_u32(address))),
         });
         IoResult::Ok
     }
