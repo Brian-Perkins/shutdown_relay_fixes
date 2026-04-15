@@ -108,11 +108,12 @@ pub enum IpProtocol {
 struct MessageBindPort {
     protocol: IpProtocol,
     address: Option<IpAddr>,
-    port: u16,
+    guest_port: u16,
+    host_port: u16,
 }
 
 enum ConsommeMessage {
-    BindPort(Rpc<MessageBindPort, Result<(), consomme::DropReason>>),
+    BindPort(Rpc<MessageBindPort, Result<u16, consomme::DropReason>>),
     UnbindPort(Rpc<MessageBindPort, Result<(), consomme::DropReason>>),
     UpdateState(Rpc<ConsommeParamsUpdateFn, ()>),
 }
@@ -123,15 +124,17 @@ impl ConsommeControl {
         &self,
         protocol: IpProtocol,
         ip_addr: Option<IpAddr>,
-        port: u16,
-    ) -> Result<(), ConsommeMessageError> {
+        guest_port: u16,
+        host_port: u16,
+    ) -> Result<u16, ConsommeMessageError> {
         self.send
             .call(
                 ConsommeMessage::BindPort,
                 MessageBindPort {
                     protocol,
                     address: ip_addr,
-                    port,
+                    guest_port,
+                    host_port,
                 },
             )
             .await
@@ -143,7 +146,7 @@ impl ConsommeControl {
     pub async fn unbind_port(
         &self,
         protocol: IpProtocol,
-        port: u16,
+        guest_port: u16,
     ) -> Result<(), ConsommeMessageError> {
         self.send
             .call(
@@ -151,7 +154,8 @@ impl ConsommeControl {
                 MessageBindPort {
                     protocol,
                     address: None,
-                    port,
+                    guest_port,
+                    host_port: 0,
                 },
             )
             .await
@@ -313,14 +317,22 @@ fn process_message(
     match message {
         ConsommeMessage::BindPort(rpc) => {
             rpc.handle_sync(|bind_message| match bind_message.protocol {
-                IpProtocol::Tcp => consomme.bind_tcp_port(bind_message.address, bind_message.port),
-                IpProtocol::Udp => consomme.bind_udp_port(bind_message.address, bind_message.port),
+                IpProtocol::Tcp => consomme.bind_tcp_port(
+                    bind_message.address,
+                    bind_message.guest_port,
+                    bind_message.host_port,
+                ),
+                IpProtocol::Udp => consomme.bind_udp_port(
+                    bind_message.address,
+                    bind_message.guest_port,
+                    bind_message.host_port,
+                ),
             });
         }
         ConsommeMessage::UnbindPort(rpc) => {
             rpc.handle_sync(|bind_message| match bind_message.protocol {
-                IpProtocol::Tcp => consomme.unbind_tcp_port(bind_message.port),
-                IpProtocol::Udp => consomme.unbind_udp_port(bind_message.port),
+                IpProtocol::Tcp => consomme.unbind_tcp_port(bind_message.guest_port),
+                IpProtocol::Udp => consomme.unbind_udp_port(bind_message.guest_port),
             });
         }
         ConsommeMessage::UpdateState(rpc) => {
