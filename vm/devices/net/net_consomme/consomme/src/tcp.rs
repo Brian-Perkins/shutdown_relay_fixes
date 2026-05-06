@@ -245,7 +245,8 @@ impl<T: Client> Access<'_, T> {
                     if let Some((socket, mut other_addr)) = result {
                         // Check for loopback requests and replace the dest port.
                         // This supports a guest owning both the sending and receiving ports.
-                        if other_addr.ip().is_loopback() {
+                        let is_loopback = other_addr.ip().is_loopback();
+                        if is_loopback {
                             for (other_ft, connection) in self.inner.tcp.connections.iter() {
                                 if connection.inner.state == TcpState::Connecting && other_ft.dst.port() == *port {
                                     if let LoopbackPortInfo::ProxyForGuestPort{sending_port, guest_port} = connection.inner.loopback_port {
@@ -256,18 +257,20 @@ impl<T: Client> Access<'_, T> {
                                     }
                                 }
                             }
+                        }
 
-                            // Replace the loopback IP with the gateway IP so
-                            // the guest's reply routes back through the virtual
-                            // adapter instead of its own loopback interface.
-                            match &mut other_addr {
-                                SocketAddr::V4(v4) => {
-                                    v4.set_ip(self.inner.state.params.gateway_ip);
-                                }
-                                SocketAddr::V6(v6) => {
-                                    v6.set_ip(self.inner.state.params.gateway_link_local_ipv6);
-                                }
+                        // If the source IP is loopback or matches the client IP address, replace
+                        // it with the gateway IP so that the guest's reply routes back through the
+                        // virtual adapter instead of its own loopback interface.
+                        let other_ip = other_addr.ip();
+                        match &mut other_addr {
+                            SocketAddr::V4(v4) if is_loopback || other_ip == self.inner.state.params.client_ip => {
+                                v4.set_ip(self.inner.state.params.gateway_ip);
                             }
+                            SocketAddr::V6(v6) if is_loopback || other_ip == self.inner.state.params.client_ip_ipv6.unwrap_or(::std::net::Ipv6Addr::UNSPECIFIED) => {
+                                v6.set_ip(self.inner.state.params.gateway_link_local_ipv6);
+                            }
+                            _ => {}
                         }
 
                         let ft = match other_addr {

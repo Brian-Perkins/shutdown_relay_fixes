@@ -63,6 +63,14 @@ fn rdnss_option_size(num_servers: usize) -> usize {
     }
 }
 
+fn is_same_subnet(addr1: Ipv6Address, addr2: Ipv6Address, prefix_len: u8) -> bool {
+    if prefix_len == 0 {
+        return true;
+    }
+    let mask = u128::MAX << (128 - prefix_len);
+    (addr1.to_bits() & mask) == (addr2.to_bits() & mask)
+}
+
 #[derive(Debug)]
 pub enum NdpMessageType {
     RouterSolicit,
@@ -317,14 +325,19 @@ impl<T: Client> Access<'_, T> {
             }
         }
 
-        // Only respond if the target is our link-local address
-        // In a stateless NAT implementation, the gateway only responds for its own
-        // link-local address, not for global addresses that clients autoconfigure
-        if target_addr != self.inner.state.params.gateway_link_local_ipv6 {
+        // For any addresses in the subnet given to the guest, provide the gateway MAC address.
+        // This is the standard mechanism to indicate all traffic flows through the gateway, even
+        // local subnet traffic.
+        if !is_same_subnet(
+            self.inner.state.params.gateway_link_local_ipv6,
+            target_addr,
+            self.inner.state.params.prefix_len_ipv6,
+        ) {
             tracing::debug!(
                 target_addr = %target_addr,
-                our_link_local = %self.inner.state.params.gateway_link_local_ipv6,
-                "NS target is not our link-local address, ignoring"
+                gateway = %self.inner.state.params.gateway_link_local_ipv6,
+                prefix_len = %self.inner.state.params.prefix_len_ipv6,
+                "NS target is not local, ignoring"
             );
             return Ok(());
         }
