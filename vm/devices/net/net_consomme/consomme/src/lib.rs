@@ -702,6 +702,7 @@ impl<T: Client> Access<'_, T> {
                 // Check if this is an NDP packet
                 let icmpv6_packet = Icmpv6Packet::new_unchecked(inner);
                 let msg_type = icmpv6_packet.msg_type();
+                tracing::info!(%msg_type, "received ICMPv6 message");
 
                 if msg_type == smoltcp::wire::Icmpv6Message::NeighborSolicit
                     || msg_type == smoltcp::wire::Icmpv6Message::NeighborAdvert
