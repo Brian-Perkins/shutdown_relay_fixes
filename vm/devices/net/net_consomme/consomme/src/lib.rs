@@ -672,6 +672,7 @@ impl<T: Client> Access<'_, T> {
     ) -> Result<(), DropReason> {
         let ipv6 = Ipv6Packet::new_unchecked(payload);
         if payload.len() < smoltcp::wire::IPV6_HEADER_LEN || ipv6.version() != 6 {
+            tracing::warn!(version = ipv6.version(), ipv6_len = ipv6.payload_len(), payload_len = payload.len(), "malformed IPv6 packet");
             return Err(DropReason::MalformedPacket);
         }
 
@@ -682,6 +683,7 @@ impl<T: Client> Access<'_, T> {
         if !segmentation_offload {
             let required_len = smoltcp::wire::IPV6_HEADER_LEN + ipv6.payload_len() as usize;
             if payload.len() < required_len {
+                tracing::warn!(version = ipv6.version(), ipv6_len = ipv6.payload_len(), payload_len = payload.len(), required_len, "malformed IPv6 packet");
                 return Err(DropReason::MalformedPacket);
             }
         }
