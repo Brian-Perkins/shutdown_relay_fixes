@@ -282,7 +282,7 @@ impl<T: Client> Access<'_, T> {
                                 let client_ipv6 = match self.inner.state.params.client_ip_ipv6 {
                                     Some(ip) => ip,
                                     None => {
-                                        tracing::warn!("Received IPv6 connection but client IPv6 address is not known");
+                                        tracing::warn!(addr = %other_addr, "Received IPv6 connection but client IPv6 address is not known");
                                         return true;
                                     }
                                 };

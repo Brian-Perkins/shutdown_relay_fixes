@@ -3816,6 +3816,9 @@ impl Adapter {
             .skip(info.name_offset as usize)?
             .read_n::<u16>(info.name_length as usize / 2)?;
         let name = String::from_utf16(&name).map_err(|_| OidError::InvalidInput("name"))?;
+        if name == "HyperVNetworkAdapterName" {
+            return Ok(());
+        }
         let mut value = reader;
         value.skip(info.value_offset as usize)?;
         let mut value = value.limit(info.value_length as usize);
@@ -3824,6 +3827,7 @@ impl Adapter {
                 let value = value.read_n::<u16>(info.value_length as usize / 2)?;
                 let value =
                     String::from_utf16(&value).map_err(|_| OidError::InvalidInput("value"))?;
+                tracing::info!(name, value, "rndis config");
                 let as_num = value
                     .as_bytes()
                     .first()
