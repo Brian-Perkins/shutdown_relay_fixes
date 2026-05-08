@@ -271,6 +271,7 @@ impl<T: Client> Access<'_, T> {
         target_addr: Ipv6Address,
         source_lladdr: Option<RawHardwareAddress>,
     ) -> Result<(), DropReason> {
+        tracing::info!(%ipv6_src_addr, %target_addr, source_lladdr = ?source_lladdr, "received Neighbor Solicitation");
         // RFC 4861 Section 7.1.1: If source is unspecified, there must be no
         // source link-layer address option
         if ipv6_src_addr.is_unspecified() && source_lladdr.is_some() {
