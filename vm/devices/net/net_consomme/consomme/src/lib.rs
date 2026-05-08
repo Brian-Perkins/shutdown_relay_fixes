@@ -596,10 +596,15 @@ impl<T: Client> Access<'_, T> {
             EthernetProtocol::Ipv6 => {
                 if self.inner.host_has_ipv6 {
                     self.handle_ipv6(&frame, frame_packet.payload(), checksum)?
+                } else {
+                    tracing::info!("ignoring IPv6 packet because host does not have a routable IPv6 address");
                 }
             }
             EthernetProtocol::Arp => self.handle_arp(&frame, frame_packet.payload())?,
-            _ => return Err(DropReason::UnsupportedEthertype(frame.ethertype)),
+            _ => {
+                tracing::warn!(ethertype = ?frame.ethertype, "unsupported ethertype");
+                return Err(DropReason::UnsupportedEthertype(frame.ethertype));
+            }
         }
         Ok(())
     }
