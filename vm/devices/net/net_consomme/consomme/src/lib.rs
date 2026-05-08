@@ -152,7 +152,7 @@ impl ConsommeParams {
             client_ip_ipv6: None,
             // Per RFC 4787, UDP NAT bindings, by default, should timeout after 5 minutes, but can be configured.
             udp_timeout: Duration::from_secs(300),
-            skip_ipv6_checks: false,
+            skip_ipv6_checks: true,
         })
     }
 
