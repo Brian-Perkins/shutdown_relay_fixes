@@ -345,6 +345,26 @@ impl<T: Client> Access<'_, T> {
             return Ok(());
         }
 
+        // Don't claim the address if it belongs to the guest. If the guest does not yet have an
+        // address, only respond for the gateway so as not to interfere with the client's address
+        // configuration.
+        if self
+            .inner
+            .state
+            .params
+            .client_ip_ipv6
+            .map(|client_ip| client_ip == target_addr)
+            .unwrap_or(self.inner.state.params.gateway_link_local_ipv6 != target_addr)
+        {
+            tracing::debug!(
+                target_addr = %target_addr,
+                client_ip = ?self.inner.state.params.client_ip_ipv6,
+                gateway = %self.inner.state.params.gateway_link_local_ipv6,
+                "Ignoring NS target"
+            );
+            return Ok(());
+        }
+
         // Send Neighbor Advertisement
         self.send_neighbor_advertisement(ipv6_src_addr, frame.src_addr, target_addr, true)
     }

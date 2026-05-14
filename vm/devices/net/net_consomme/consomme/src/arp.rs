@@ -40,11 +40,13 @@ impl<T: Client> Access<'_, T> {
         // For any addresses in the subnet given to the guest, provide the gateway MAC address.
         // This is the standard mechanism to indicate all traffic flows through the gateway, even
         // local subnet traffic.
-        if !is_same_subnet(
-            self.inner.state.params.gateway_ip,
-            target_protocol_addr,
-            self.inner.state.params.net_mask,
-        ) {
+        if self.inner.state.params.client_ip == target_protocol_addr
+            || !is_same_subnet(
+                self.inner.state.params.gateway_ip,
+                target_protocol_addr,
+                self.inner.state.params.net_mask,
+            )
+        {
             tracing::debug!(?target_protocol_addr, gateway = %self.inner.state.params.gateway_ip, subnet_mask = %self.inner.state.params.net_mask, "Ignoring ARP request");
             return Ok(());
         }
