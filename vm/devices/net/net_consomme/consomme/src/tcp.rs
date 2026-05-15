@@ -442,6 +442,7 @@ impl<T: Client> Access<'_, T> {
                     // This connection is already closed. Ignore the packet.
                 } else if let Some(ack) = tcp.ack_number {
                     // This is for an old connection. Send reset.
+                    tracing::error!(f = ?ft, ack_number = ?ack, "received packet for non-existent connection, sending RST");
                     sender.rst(ack, None);
                 } else if tcp.control == TcpControl::Syn {
                     let conn = if is_dns_tcp {
@@ -810,6 +811,11 @@ impl TcpConnectionInner {
                     );
                 }
                 Poll::Ready(Err(_)) => {
+                    tracing::warn!(
+                        src = %sender.ft.src,
+                        dst = %sender.ft.dst,
+                        "tcp: error reading from DNS handler, resetting connection"
+                    );
                     sender.rst(self.tx_send, Some(self.rx_seq));
                     return false;
                 }
@@ -827,6 +833,11 @@ impl TcpConnectionInner {
             Ok(_) => {}
             Err(_) => {
                 // Invalid DNS TCP framing; reset the connection.
+                tracing::warn!(
+                    src = %sender.ft.src,
+                    dst = %sender.ft.dst,
+                    "tcp: invalid DNS TCP framing, resetting connection"
+                );
                 sender.rst(self.tx_send, Some(self.rx_seq));
                 return false;
             }
@@ -881,7 +892,10 @@ impl TcpConnectionInner {
                     if events.has_err() {
                         let err = take_socket_error(socket);
                         match err.kind() {
-                            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset => {}
+                            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset => tracelimit::info_ratelimited!(
+                                error = &err as &dyn std::error::Error,
+                                "socket closed after fin"
+                            ),
                             _ => tracelimit::warn_ratelimited!(
                                 error = &err as &dyn std::error::Error,
                                 src = %sender.ft.src,
@@ -910,7 +924,7 @@ impl TcpConnectionInner {
                         }
                         Poll::Ready(Err(err)) => {
                             match err.kind() {
-                                ErrorKind::ConnectionReset => tracing::trace!(
+                                ErrorKind::ConnectionReset => tracelimit::info_ratelimited!(
                                     error = &err as &dyn std::error::Error,
                                     src = %sender.ft.src,
                                     dst = %sender.ft.dst,
@@ -944,7 +958,10 @@ impl TcpConnectionInner {
                     }
                     Poll::Ready(Err(err)) => {
                         match err.kind() {
-                            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset => {}
+                            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset => tracelimit::info_ratelimited!(
+                                error = &err as &dyn std::error::Error,
+                                "socket closed after fin"
+                            ),
                             _ => {
                                 tracelimit::warn_ratelimited!(
                                     error = &err as &dyn std::error::Error,
@@ -1283,6 +1300,7 @@ impl TcpConnectionInner {
         // Handle ACK of our SYN.
         if self.state == TcpState::SynReceived {
             if ack_number <= self.tx_acked || ack_number > self.tx_send {
+                tracing::error!(?ack_number, tx_acked = ?self.tx_acked, tx_send = ?self.tx_send, "invalid ack number for syn, drop connection");
                 sender.rst(ack_number, None);
                 return Ok(false);
             }
@@ -1515,7 +1533,7 @@ fn log_connect_error(ft: &FourTuple, err: &io::Error) {
         }
         ErrorKind::NetworkUnreachable | ErrorKind::HostUnreachable => {
             // FUTURE: send ICMP unreachable to guest
-            tracing::debug!(
+            tracing::error!(
                 error = err as &dyn std::error::Error,
                 src = %ft.src,
                 dst = %ft.dst,
