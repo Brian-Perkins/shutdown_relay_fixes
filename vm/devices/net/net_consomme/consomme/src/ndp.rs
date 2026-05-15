@@ -285,11 +285,15 @@ impl<T: Client> Access<'_, T> {
         // If source is unspecified (::), this is DAD - we should NOT respond
         // to avoid interfering with the client's address configuration
         if ipv6_src_addr.is_unspecified() {
-            self.inner.state.params.client_ip_ipv6 = Some(target_addr);
+            if target_addr.is_unicast_link_local() {
+                self.inner.state.params.client_ip_ipv6 = Some(target_addr);
+            } else {
+                self.inner.state.params.client_ip_ipv6_routable = Some(target_addr);
+            }
             tracing::info!(
                 target_addr = %target_addr,
                 source_lladr = ?source_lladdr,
-                "received DAD Neighbor Solicitation, silently ignoring"
+                "received DAD Neighbor Solicitation"
             );
             return Ok(());
         }
@@ -313,20 +317,20 @@ impl<T: Client> Access<'_, T> {
         // When the client performs address resolution using their SLAAC-configured
         // global address, we learn it here. We only learn global unicast addresses
         // (not link-local, multicast, or unspecified).
-        if !ipv6_src_addr.is_unicast_link_local()
-            && !ipv6_src_addr.is_multicast()
-            && !ipv6_src_addr.is_unspecified()
-        {
-            if self.inner.state.params.client_ip_ipv6.is_none()
-                || self.inner.state.params.client_ip_ipv6 != Some(ipv6_src_addr)
-            {
-                tracing::debug!(
-                    client_ipv6 = %ipv6_src_addr,
-                    "learned client IPv6 address from Neighbor Solicitation"
-                );
-                self.inner.state.params.client_ip_ipv6 = Some(ipv6_src_addr);
-            }
-        }
+        // if !ipv6_src_addr.is_unicast_link_local()
+        //     && !ipv6_src_addr.is_multicast()
+        //     && !ipv6_src_addr.is_unspecified()
+        // {
+        //     if self.inner.state.params.client_ip_ipv6.is_none()
+        //         || self.inner.state.params.client_ip_ipv6 != Some(ipv6_src_addr)
+        //     {
+        //         tracing::debug!(
+        //             client_ipv6 = %ipv6_src_addr,
+        //             "learned client IPv6 address from Neighbor Solicitation"
+        //         );
+        //         self.inner.state.params.client_ip_ipv6 = Some(ipv6_src_addr);
+        //     }
+        // }
 
         // For any addresses in the subnet given to the guest, provide the gateway MAC address.
         // This is the standard mechanism to indicate all traffic flows through the gateway, even
@@ -336,7 +340,7 @@ impl<T: Client> Access<'_, T> {
             target_addr,
             self.inner.state.params.prefix_len_ipv6,
         ) {
-            tracing::debug!(
+            tracing::info!(
                 target_addr = %target_addr,
                 gateway = %self.inner.state.params.gateway_link_local_ipv6,
                 prefix_len = %self.inner.state.params.prefix_len_ipv6,
@@ -356,7 +360,7 @@ impl<T: Client> Access<'_, T> {
             .map(|client_ip| client_ip == target_addr)
             .unwrap_or(self.inner.state.params.gateway_link_local_ipv6 != target_addr)
         {
-            tracing::debug!(
+            tracing::info!(
                 target_addr = %target_addr,
                 client_ip = ?self.inner.state.params.client_ip_ipv6,
                 gateway = %self.inner.state.params.gateway_link_local_ipv6,

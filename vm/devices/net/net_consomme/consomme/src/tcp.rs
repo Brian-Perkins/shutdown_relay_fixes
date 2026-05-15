@@ -262,12 +262,11 @@ impl<T: Client> Access<'_, T> {
                         // If the source IP is loopback or matches the client IP address, replace
                         // it with the gateway IP so that the guest's reply routes back through the
                         // virtual adapter instead of its own loopback interface.
-                        let other_ip = other_addr.ip();
                         match &mut other_addr {
-                            SocketAddr::V4(v4) if is_loopback || other_ip == self.inner.state.params.client_ip => {
+                            SocketAddr::V4(v4) if is_loopback || v4.ip() == &self.inner.state.params.client_ip => {
                                 v4.set_ip(self.inner.state.params.gateway_ip);
                             }
-                            SocketAddr::V6(v6) if is_loopback || other_ip == self.inner.state.params.client_ip_ipv6.unwrap_or(::std::net::Ipv6Addr::UNSPECIFIED) => {
+                            SocketAddr::V6(v6) if is_loopback || v6.ip() == &self.inner.state.params.client_ip_ipv6.unwrap_or(::std::net::Ipv6Addr::UNSPECIFIED) || v6.ip() == &self.inner.state.params.client_ip_ipv6_routable.unwrap_or(::std::net::Ipv6Addr::UNSPECIFIED) => {
                                 v6.set_ip(self.inner.state.params.gateway_link_local_ipv6);
                             }
                             _ => {}
@@ -278,13 +277,16 @@ impl<T: Client> Access<'_, T> {
                                 dst: other_addr,
                                 src: SocketAddr::V4(SocketAddrV4::new(self.inner.state.params.client_ip, *port)),
                             },
-                            SocketAddr::V6(_) => {
-                                let client_ipv6 = match self.inner.state.params.client_ip_ipv6 {
-                                    Some(ip) => ip,
-                                    None => {
-                                        tracing::warn!(addr = %other_addr, "Received IPv6 connection but client IPv6 address is not known");
-                                        return true;
-                                    }
+                            SocketAddr::V6(v6) => {
+                                let client_ipv6 = if !v6.ip().is_unicast_link_local() && self.inner.state.params.client_ip_ipv6_routable.is_some() {
+                                    self.inner.state.params.client_ip_ipv6_routable.unwrap()
+                                } else if self.inner.state.params.client_ip_ipv6.is_some() {
+                                    self.inner.state.params.client_ip_ipv6.unwrap()
+                                } else if self.inner.state.params.client_ip_ipv6_routable.is_some() {
+                                    self.inner.state.params.client_ip_ipv6_routable.unwrap()
+                                } else {
+                                    tracing::warn!(addr = %other_addr, "Received IPv6 connection but client IPv6 address is not known");
+                                    return true;
                                 };
                                 FourTuple {
                                     dst: other_addr,

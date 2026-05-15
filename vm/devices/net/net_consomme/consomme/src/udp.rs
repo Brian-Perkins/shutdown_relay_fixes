@@ -240,18 +240,24 @@ impl UdpListener {
             }
 
             // Determine header offset and guest destination from the bound socket's address family.
-            let local_addr = match socket.get().local_addr() {
+            let peer_addr = match socket.get().peer_addr() {
                 Ok(addr) => addr,
                 Err(_) => break,
             };
-            let (header_offset, guest_dst_ip, guest_mac) = match local_addr.ip() {
+            let (header_offset, guest_dst_ip, guest_mac) = match peer_addr.ip() {
                 IpAddr::V4(_) => (
                     IPV4_HEADER_LEN + UDP_HEADER_LEN,
                     IpAddr::V4(state.params.client_ip),
                     state.params.client_mac,
                 ),
-                IpAddr::V6(_) => {
-                    let Some(client_ipv6) = state.params.client_ip_ipv6 else {
+                IpAddr::V6(v6) => {
+                    let client_ipv6 = if !v6.is_unicast_link_local() && state.params.client_ip_ipv6_routable.is_some() {
+                        state.params.client_ip_ipv6_routable.unwrap()
+                    } else if state.params.client_ip_ipv6.is_some() {
+                        state.params.client_ip_ipv6.unwrap()
+                    } else if state.params.client_ip_ipv6_routable.is_some() {
+                        state.params.client_ip_ipv6_routable.unwrap()
+                    } else {
                         break;
                     };
                     (
@@ -310,7 +316,7 @@ impl UdpListener {
                         }
                         _ => {
                             tracelimit::warn_ratelimited!(
-                                local_addr = %local_addr,
+                                peer_addr = %peer_addr,
                                 src_addr = %src_addr,
                                 "udp listener received packet with mismatched address family"
                             );
