@@ -288,8 +288,10 @@ impl<T: Client> Access<'_, T> {
                                     tracing::warn!(addr = %other_addr, "Received IPv6 connection but client IPv6 address is not known");
                                     return true;
                                 };
+                                // Remove flow info and scope id from the source address.
+                                let dst = SocketAddr::V6(SocketAddrV6::new(v6.ip().clone(), v6.port(), 0, 0));
                                 FourTuple {
-                                    dst: other_addr,
+                                    dst,
                                     src: SocketAddr::V6(SocketAddrV6::new(client_ipv6, *port, 0, 0)),
                                 }
                             }
