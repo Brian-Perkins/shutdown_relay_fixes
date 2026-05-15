@@ -1194,6 +1194,7 @@ impl TcpConnectionInner {
 
         let ack_number = tcp.ack_number.ok_or(TcpError::MissingAck)?;
         if ack_number <= self.tx_acked || ack_number > self.tx_send {
+            tracing::error!(?ack_number, tx_acked = ?self.tx_acked, tx_send = ?self.tx_send, "invalid ack number, drop connection");
             sender.rst(ack_number, None);
             return Ok(false);
         }
