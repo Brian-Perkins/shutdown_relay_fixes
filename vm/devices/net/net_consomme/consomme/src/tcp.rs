@@ -294,6 +294,7 @@ impl<T: Client> Access<'_, T> {
                                 }
                             }
                         };
+                        tracing::info!(?ft, "New TCP connection accepted");
 
                         match self.inner.tcp.connections.entry(ft) {
                             hash_map::Entry::Vacant(e) => {
