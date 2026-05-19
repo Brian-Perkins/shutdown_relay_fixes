@@ -50,9 +50,24 @@ use smoltcp::wire::Ipv4Address;
 use smoltcp::wire::Ipv4Packet;
 use smoltcp::wire::Ipv6Address;
 use smoltcp::wire::Ipv6Packet;
+use std::net::SocketAddr;
+use std::net::SocketAddrV4;
+use std::net::SocketAddrV6;
 use std::task::Context;
 use std::time::Duration;
 use thiserror::Error;
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+struct FourTuple {
+    src: SocketAddr,
+    dst: SocketAddr,
+}
+
+impl core::fmt::Display for FourTuple {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}-{}", self.src, self.dst)
+    }
+}
 
 /// A consomme instance.
 #[derive(InspectMut)]
@@ -244,6 +259,70 @@ impl ConsommeParams {
             ns.push(self.gateway_link_local_ipv6.into());
         }
         ns
+    }
+
+    fn is_local_address(&self, addr: &SocketAddr) -> bool {
+        match addr {
+            SocketAddr::V4(v4) => v4.ip().is_loopback() || v4.ip() == &self.client_ip,
+            SocketAddr::V6(v6) => {
+                v6.ip().is_loopback()
+                    || v6.ip()
+                        == &self
+                            .client_ip_ipv6
+                            .unwrap_or(::std::net::Ipv6Addr::UNSPECIFIED)
+                    || v6.ip()
+                        == &self
+                            .client_ip_ipv6_routable
+                            .unwrap_or(::std::net::Ipv6Addr::UNSPECIFIED)
+            }
+        }
+    }
+
+    fn try_ft_from_remote_address(
+        &self,
+        remote_addr: &SocketAddr,
+        dst_port: u16,
+    ) -> Option<FourTuple> {
+        // Pick the best destination (guest) address based on the origination of the remote packet.
+        let dst = match remote_addr {
+            SocketAddr::V4(_) => SocketAddr::V4(SocketAddrV4::new(self.client_ip, dst_port)),
+            SocketAddr::V6(v6) => {
+                // Pick the best local IPv6 address based on the remote IP.
+                let client_ipv6 = if !v6.ip().is_unicast_link_local()
+                    && let Some(routable) = self.client_ip_ipv6_routable
+                {
+                    routable
+                } else if let Some(ipv6) = self.client_ip_ipv6 {
+                    ipv6
+                } else if let Some(routable) = self.client_ip_ipv6_routable {
+                    routable
+                } else {
+                    tracelimit::warn_ratelimited!(addr = %remote_addr, "Client IPv6 address is not known, dropping packet");
+                    return None;
+                };
+
+                SocketAddr::V6(SocketAddrV6::new(client_ipv6, dst_port, 0, 0))
+            }
+        };
+
+        // If the remote IP is loopback or matches the client IP address, replace
+        // it with the gateway IP so that the guest's reply routes back through the
+        // virtual adapter instead of its own loopback interface.
+        let src = match remote_addr {
+            SocketAddr::V4(v4) if self.is_local_address(remote_addr) => {
+                SocketAddr::V4(SocketAddrV4::new(self.gateway_ip, v4.port()))
+            }
+            SocketAddr::V6(v6) if self.is_local_address(remote_addr) => SocketAddr::V6(
+                SocketAddrV6::new(self.gateway_link_local_ipv6, v6.port(), 0, 0),
+            ),
+            SocketAddr::V6(v6) => {
+                // Remove flow info and scope id from the source address.
+                SocketAddr::V6(SocketAddrV6::new(*v6.ip(), v6.port(), 0, 0))
+            }
+            _ => *remote_addr,
+        };
+
+        Some(FourTuple { src, dst })
     }
 }
 
@@ -467,6 +546,22 @@ impl IpAddresses {
     }
 }
 
+impl From<FourTuple> for IpAddresses {
+    fn from(ft: FourTuple) -> Self {
+        match (ft.src, ft.dst) {
+            (SocketAddr::V4(src), SocketAddr::V4(dst)) => IpAddresses::V4(Ipv4Addresses {
+                src_addr: *src.ip(),
+                dst_addr: *dst.ip(),
+            }),
+            (SocketAddr::V6(src), SocketAddr::V6(dst)) => IpAddresses::V6(Ipv6Addresses {
+                src_addr: *src.ip(),
+                dst_addr: *dst.ip(),
+            }),
+            _ => panic!("invalid four-tuple with mixed IP versions"),
+        }
+    }
+}
+
 /// Returns `true` if the given IPv6 address is a globally routable unicast
 /// address (i.e., not loopback, unspecified, or link-local).
 fn is_routable_ipv6(addr: &std::net::Ipv6Addr) -> bool {
@@ -603,7 +698,9 @@ impl<T: Client> Access<'_, T> {
                 if self.inner.host_has_ipv6 {
                     self.handle_ipv6(&frame, frame_packet.payload(), checksum)?
                 } else {
-                    tracing::info!("ignoring IPv6 packet because host does not have a routable IPv6 address");
+                    tracing::info!(
+                        "ignoring IPv6 packet because host does not have a routable IPv6 address"
+                    );
                 }
             }
             EthernetProtocol::Arp => self.handle_arp(&frame, frame_packet.payload())?,
@@ -683,7 +780,12 @@ impl<T: Client> Access<'_, T> {
     ) -> Result<(), DropReason> {
         let ipv6 = Ipv6Packet::new_unchecked(payload);
         if payload.len() < smoltcp::wire::IPV6_HEADER_LEN || ipv6.version() != 6 {
-            tracing::warn!(version = ipv6.version(), ipv6_len = ipv6.payload_len(), payload_len = payload.len(), "malformed IPv6 packet");
+            tracing::warn!(
+                version = ipv6.version(),
+                ipv6_len = ipv6.payload_len(),
+                payload_len = payload.len(),
+                "malformed IPv6 packet"
+            );
             return Err(DropReason::MalformedPacket);
         }
 
@@ -694,7 +796,13 @@ impl<T: Client> Access<'_, T> {
         if !segmentation_offload {
             let required_len = smoltcp::wire::IPV6_HEADER_LEN + ipv6.payload_len() as usize;
             if payload.len() < required_len {
-                tracing::warn!(version = ipv6.version(), ipv6_len = ipv6.payload_len(), payload_len = payload.len(), required_len, "malformed IPv6 packet");
+                tracing::warn!(
+                    version = ipv6.version(),
+                    ipv6_len = ipv6.payload_len(),
+                    payload_len = payload.len(),
+                    required_len,
+                    "malformed IPv6 packet"
+                );
                 return Err(DropReason::MalformedPacket);
             }
         }

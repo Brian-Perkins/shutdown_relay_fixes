@@ -10,6 +10,7 @@ use super::Client;
 use super::DropReason;
 use crate::ChecksumState;
 use crate::ConsommeState;
+use crate::FourTuple;
 use crate::IpAddresses;
 use crate::dns_resolver::DnsResolver;
 use crate::dns_resolver::dns_tcp::DnsTcpHandler;
@@ -56,18 +57,6 @@ use std::pin::Pin;
 use std::task::Context;
 use std::task::Poll;
 use thiserror::Error;
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
-struct FourTuple {
-    src: SocketAddr,
-    dst: SocketAddr,
-}
-
-impl core::fmt::Display for FourTuple {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}-{}", self.src, self.dst)
-    }
-}
 
 #[derive(InspectMut)]
 pub(crate) struct Tcp {
@@ -185,6 +174,7 @@ fn inspect_seq(seq: &TcpSeqNumber) -> inspect::AsHex<u32> {
 struct TcpListener {
     #[inspect(skip)]
     socket: PolledSocket<Socket>,
+    host_port: u16,
 }
 
 #[derive(Debug, PartialEq, Eq, Inspect)]
@@ -243,12 +233,11 @@ impl<T: Client> Access<'_, T> {
             .retain(|port, listener| match listener.poll_listener(cx) {
                 Ok(result) => {
                     if let Some((socket, mut other_addr)) = result {
-                        // Check for loopback requests and replace the dest port.
-                        // This supports a guest owning both the sending and receiving ports.
-                        let is_loopback = other_addr.ip().is_loopback();
-                        if is_loopback {
+                        // If this packet was originally from the guest, update the port to match
+                        // the original guest port. This allows loopback to work as expected.
+                        if self.inner.state.params.is_local_address(&other_addr) {
                             for (other_ft, connection) in self.inner.tcp.connections.iter() {
-                                if connection.inner.state == TcpState::Connecting && other_ft.dst.port() == *port {
+                                if connection.inner.state == TcpState::Connecting && other_ft.dst.port() == other_addr.port() {
                                     if let LoopbackPortInfo::ProxyForGuestPort{sending_port, guest_port} = connection.inner.loopback_port {
                                         if sending_port == other_addr.port() {
                                             other_addr.set_port(guest_port);
@@ -258,45 +247,16 @@ impl<T: Client> Access<'_, T> {
                                 }
                             }
                         }
-
-                        // If the source IP is loopback or matches the client IP address, replace
-                        // it with the gateway IP so that the guest's reply routes back through the
-                        // virtual adapter instead of its own loopback interface.
-                        match &mut other_addr {
-                            SocketAddr::V4(v4) if is_loopback || v4.ip() == &self.inner.state.params.client_ip => {
-                                v4.set_ip(self.inner.state.params.gateway_ip);
-                            }
-                            SocketAddr::V6(v6) if is_loopback || v6.ip() == &self.inner.state.params.client_ip_ipv6.unwrap_or(::std::net::Ipv6Addr::UNSPECIFIED) || v6.ip() == &self.inner.state.params.client_ip_ipv6_routable.unwrap_or(::std::net::Ipv6Addr::UNSPECIFIED) => {
-                                v6.set_ip(self.inner.state.params.gateway_link_local_ipv6);
-                            }
-                            _ => {}
-                        }
-
-                        let ft = match other_addr {
-                            SocketAddr::V4(_) => FourTuple {
-                                dst: other_addr,
-                                src: SocketAddr::V4(SocketAddrV4::new(self.inner.state.params.client_ip, *port)),
-                            },
-                            SocketAddr::V6(v6) => {
-                                let client_ipv6 = if !v6.ip().is_unicast_link_local() && self.inner.state.params.client_ip_ipv6_routable.is_some() {
-                                    self.inner.state.params.client_ip_ipv6_routable.unwrap()
-                                } else if self.inner.state.params.client_ip_ipv6.is_some() {
-                                    self.inner.state.params.client_ip_ipv6.unwrap()
-                                } else if self.inner.state.params.client_ip_ipv6_routable.is_some() {
-                                    self.inner.state.params.client_ip_ipv6_routable.unwrap()
-                                } else {
-                                    tracing::warn!(addr = %other_addr, "Received IPv6 connection but client IPv6 address is not known");
-                                    return true;
-                                };
-                                // Remove flow info and scope id from the source address.
-                                let dst = SocketAddr::V6(SocketAddrV6::new(v6.ip().clone(), v6.port(), 0, 0));
-                                FourTuple {
-                                    dst,
-                                    src: SocketAddr::V6(SocketAddrV6::new(client_ipv6, *port, 0, 0)),
-                                }
-                            }
+                        let Some(ft) = self.inner.state.params.try_ft_from_remote_address(&other_addr, *port) else {
+                            return true;
                         };
                         tracing::info!(?ft, "New TCP connection accepted");
+
+                        // TCP connections are stored with the source always as the guest. Switch the order.
+                        let ft = FourTuple {
+                            src: ft.dst,
+                            dst: ft.src,
+                        };
 
                         match self.inner.tcp.connections.entry(ft) {
                             hash_map::Entry::Vacant(e) => {
@@ -455,7 +415,31 @@ impl<T: Client> Access<'_, T> {
                             &self.inner.tcp.connection_params,
                         )?
                     } else {
-                        TcpConnection::new(&mut sender, &tcp, &self.inner.tcp.connection_params)?
+                        // If this is directed to a local port owned by the guest, use the
+                        // appropriate host port substitution.
+                        let is_local_address = sender.state.params.is_local_address(&sender.ft.dst);
+                        let ft = if is_local_address
+                            && let Some(listener) =
+                                self.inner.tcp.listeners.get(&sender.ft.dst.port())
+                        {
+                            FourTuple {
+                                src: sender.ft.src,
+                                dst: SocketAddr::new(sender.ft.dst.ip(), listener.host_port),
+                            }
+                        } else {
+                            ft
+                        };
+                        let mut sender = Sender {
+                            ft: &ft,
+                            client: sender.client,
+                            state: sender.state,
+                        };
+                        TcpConnection::new(
+                            &mut sender,
+                            &tcp,
+                            &self.inner.tcp.connection_params,
+                            is_local_address,
+                        )?
                     };
                     e.insert(conn);
                 } else {
@@ -632,6 +616,7 @@ impl TcpConnection {
         sender: &mut Sender<'_, impl Client>,
         tcp: &TcpRepr<'_>,
         params: &ConnectionParams,
+        is_local_address: bool,
     ) -> Result<Self, DropReason> {
         let mut inner = Self::new_base(params);
         inner.initialize_from_first_client_packet(tcp)?;
@@ -666,7 +651,7 @@ impl TcpConnection {
                 return Err(DropReason::Io(err));
             }
         }
-        if let Ok(addr) = socket.get().local_addr() {
+        if is_local_address && let Ok(addr) = socket.get().local_addr() {
             match addr.as_socket() {
                 None => {
                     tracing::warn!(
@@ -676,12 +661,10 @@ impl TcpConnection {
                     );
                 }
                 Some(addr) => {
-                    if addr.ip().is_loopback() {
-                        inner.loopback_port = LoopbackPortInfo::ProxyForGuestPort {
-                            sending_port: addr.port(),
-                            guest_port: sender.ft.src.port(),
-                        };
-                    }
+                    inner.loopback_port = LoopbackPortInfo::ProxyForGuestPort {
+                        sending_port: addr.port(),
+                        guest_port: sender.ft.src.port(),
+                    };
                 }
             }
         }
@@ -895,10 +878,12 @@ impl TcpConnectionInner {
                     if events.has_err() {
                         let err = take_socket_error(socket);
                         match err.kind() {
-                            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset => tracelimit::info_ratelimited!(
-                                error = &err as &dyn std::error::Error,
-                                "socket closed after fin"
-                            ),
+                            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset => {
+                                tracelimit::info_ratelimited!(
+                                    error = &err as &dyn std::error::Error,
+                                    "socket closed after fin"
+                                )
+                            }
                             _ => tracelimit::warn_ratelimited!(
                                 error = &err as &dyn std::error::Error,
                                 src = %sender.ft.src,
@@ -961,10 +946,12 @@ impl TcpConnectionInner {
                     }
                     Poll::Ready(Err(err)) => {
                         match err.kind() {
-                            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset => tracelimit::info_ratelimited!(
-                                error = &err as &dyn std::error::Error,
-                                "socket closed after fin"
-                            ),
+                            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset => {
+                                tracelimit::info_ratelimited!(
+                                    error = &err as &dyn std::error::Error,
+                                    "socket closed after fin"
+                                )
+                            }
                             _ => {
                                 tracelimit::warn_ratelimited!(
                                     error = &err as &dyn std::error::Error,
@@ -1451,6 +1438,16 @@ impl TcpListener {
     /// The socket must already be bound to an address. This method will call
     /// `listen` on it.
     pub fn from_socket(driver: &dyn Driver, socket: Socket) -> Result<Self, BindError> {
+        let Some(host_port) = socket
+            .local_addr()
+            .map_err(BindError::Io)?
+            .as_socket()
+            .map(|addr| addr.port())
+        else {
+            return Err(BindError::Io(io::Error::other(
+                "socket local address is not a socket address",
+            )));
+        };
         let socket = PolledSocket::new(driver, socket).map_err(BindError::Io)?;
         if let Err(err) = socket.listen(10) {
             tracing::warn!(
@@ -1459,7 +1456,7 @@ impl TcpListener {
             );
             return Err(BindError::Io(err));
         }
-        Ok(Self { socket })
+        Ok(Self { socket, host_port })
     }
 
     fn poll_listener(

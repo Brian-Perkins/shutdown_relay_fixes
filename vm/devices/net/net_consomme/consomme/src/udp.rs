@@ -10,6 +10,7 @@ use super::dhcpv6::DHCPV6_ALL_AGENTS_MULTICAST;
 use super::dhcpv6::DHCPV6_SERVER;
 use crate::ChecksumState;
 use crate::ConsommeState;
+use crate::FourTuple;
 use crate::IpAddresses;
 use crate::Ipv4Addresses;
 use crate::Ipv6Addresses;
@@ -95,6 +96,9 @@ impl InspectMut for Udp {
 struct UdpListener {
     #[inspect(skip)]
     socket: Option<PolledSocket<UdpSocket>>,
+    // The host port that is listening for UDP packets.
+    #[inspect(display)]
+    host_port: u16,
     /// The guest port to forward received packets to.
     #[inspect(display)]
     guest_port: u16,
@@ -105,6 +109,7 @@ struct UdpListener {
 struct UdpConnection {
     #[inspect(skip)]
     socket: Option<PolledSocket<UdpSocket>>,
+    host_port: u16,
     #[inspect(display)]
     guest_mac: EthernetAddress,
     stats: Stats,
@@ -162,49 +167,30 @@ impl UdpConnection {
                 },
             ) {
                 Poll::Ready(Ok((n, src_addr))) => {
-                    // Replace loopback source IPs with the gateway IP so
-                    // the guest's reply routes back through the virtual
-                    // adapter instead of its own loopback interface.
-                    let (packet_len, checksum_state) = match (dst_addr, src_addr.ip()) {
-                        (SocketAddr::V4(dst), IpAddr::V4(src_ip)) => {
-                            let effective_src_ip: IpAddress = if src_ip.is_loopback() {
-                                state.params.gateway_ip.into()
-                            } else {
-                                src_ip.into()
-                            };
-                            let len = build_udp_packet(
-                                &mut eth,
-                                effective_src_ip,
-                                (*dst.ip()).into(),
-                                src_addr.port(),
-                                dst.port(),
-                                n,
-                                state.params.gateway_mac,
-                                self.guest_mac,
-                            );
-                            (len, ChecksumState::UDP4)
-                        }
-                        (SocketAddr::V6(dst), IpAddr::V6(src_ip)) => {
-                            let effective_src_ip: IpAddress = if src_ip.is_loopback() {
-                                state.params.gateway_link_local_ipv6.into()
-                            } else {
-                                src_ip.into()
-                            };
-                            let len = build_udp_packet(
-                                &mut eth,
-                                effective_src_ip,
-                                (*dst.ip()).into(),
-                                src_addr.port(),
-                                dst.port(),
-                                n,
-                                state.params.gateway_mac,
-                                self.guest_mac,
-                            );
-                            (len, ChecksumState::NONE)
-                        }
-                        _ => unreachable!("mismatched address families"),
+                    let ft = match state
+                        .params
+                        .try_ft_from_remote_address(&src_addr, dst_addr.port())
+                    {
+                        Some(ft) => ft,
+                        None => FourTuple {
+                            src: src_addr,
+                            dst: *dst_addr,
+                        },
                     };
-
+                    let packet_len = build_udp_packet(
+                        &mut eth,
+                        ft.src.ip().into(),
+                        ft.dst.ip().into(),
+                        ft.src.port(),
+                        ft.dst.port(),
+                        n,
+                        state.params.gateway_mac,
+                        self.guest_mac,
+                    );
+                    let checksum_state = match dst_addr {
+                        SocketAddr::V4(_) => ChecksumState::UDP4,
+                        SocketAddr::V6(_) => ChecksumState::NONE,
+                    };
                     client.recv(&eth.as_ref()[..packet_len], &checksum_state);
                     self.stats.rx_packets.increment();
                     self.last_activity = Instant::now();
@@ -229,6 +215,7 @@ impl UdpListener {
         cx: &mut Context<'_>,
         state: &mut ConsommeState,
         client: &mut impl Client,
+        connections: &HashMap<SocketAddr, UdpConnection>,
     ) {
         let Some(socket) = self.socket.as_mut() else {
             return;
@@ -239,93 +226,55 @@ impl UdpListener {
                 break;
             }
 
-            // Determine header offset and guest destination from the bound socket's address family.
-            let peer_addr = match socket.get().peer_addr() {
-                Ok(addr) => addr,
-                Err(_) => break,
-            };
-            let (header_offset, guest_dst_ip, guest_mac) = match peer_addr.ip() {
-                IpAddr::V4(_) => (
-                    IPV4_HEADER_LEN + UDP_HEADER_LEN,
-                    IpAddr::V4(state.params.client_ip),
-                    state.params.client_mac,
-                ),
-                IpAddr::V6(v6) => {
-                    let client_ipv6 = if !v6.is_unicast_link_local() && state.params.client_ip_ipv6_routable.is_some() {
-                        state.params.client_ip_ipv6_routable.unwrap()
-                    } else if state.params.client_ip_ipv6.is_some() {
-                        state.params.client_ip_ipv6.unwrap()
-                    } else if state.params.client_ip_ipv6_routable.is_some() {
-                        state.params.client_ip_ipv6_routable.unwrap()
-                    } else {
-                        break;
-                    };
-                    (
-                        IPV6_HEADER_LEN + UDP_HEADER_LEN,
-                        IpAddr::V6(client_ipv6),
-                        state.params.client_mac,
-                    )
-                }
+            let Ok(local_addr) = socket.get().local_addr() else {
+                tracelimit::warn_ratelimited!(
+                    host_port = self.host_port,
+                    guest_port = self.guest_port,
+                    "Failed to get UDP local address"
+                );
+                break;
             };
 
+            let header_offset = match local_addr.ip() {
+                IpAddr::V4(_) => IPV4_HEADER_LEN + UDP_HEADER_LEN,
+                IpAddr::V6(_) => IPV6_HEADER_LEN + UDP_HEADER_LEN,
+            };
             match socket.poll_io(cx, InterestSlot::Read, PollEvents::IN, |socket| {
                 socket
                     .get()
                     .recv_from(&mut eth.payload_mut()[header_offset..])
             }) {
-                Poll::Ready(Ok((n, src_addr))) => {
-                    // Replace loopback source IPs with the gateway IP so
-                    // the guest's reply routes back through the virtual
-                    // adapter instead of its own loopback interface.
-                    let Some((packet_len, checksum_state)) = (match (guest_dst_ip, src_addr.ip()) {
-                        (IpAddr::V4(dst_ip), IpAddr::V4(src_ip)) => {
-                            let effective_src_ip: IpAddress = if src_ip.is_loopback() {
-                                state.params.gateway_ip.into()
-                            } else {
-                                src_ip.into()
-                            };
-                            let len = build_udp_packet(
-                                &mut eth,
-                                effective_src_ip,
-                                dst_ip.into(),
-                                src_addr.port(),
-                                self.guest_port,
-                                n,
-                                state.params.gateway_mac,
-                                guest_mac,
-                            );
-                            Some((len, ChecksumState::UDP4))
+                Poll::Ready(Ok((n, mut other_addr))) => {
+                    // Check if this packet originated from the same guest, and adjust the port accordingly.
+                    if state.params.is_local_address(&other_addr) {
+                        for (guest_addr, connection) in connections.iter() {
+                            if other_addr.port() == connection.host_port {
+                                other_addr.set_port(guest_addr.port());
+                                break;
+                            }
                         }
-                        (IpAddr::V6(dst_ip), IpAddr::V6(src_ip)) => {
-                            let effective_src_ip: IpAddress = if src_ip.is_loopback() {
-                                state.params.gateway_link_local_ipv6.into()
-                            } else {
-                                src_ip.into()
-                            };
-                            let len = build_udp_packet(
-                                &mut eth,
-                                effective_src_ip,
-                                dst_ip.into(),
-                                src_addr.port(),
-                                self.guest_port,
-                                n,
-                                state.params.gateway_mac,
-                                guest_mac,
-                            );
-                            Some((len, ChecksumState::NONE))
-                        }
-                        _ => {
-                            tracelimit::warn_ratelimited!(
-                                peer_addr = %peer_addr,
-                                src_addr = %src_addr,
-                                "udp listener received packet with mismatched address family"
-                            );
-                            None
-                        }
-                    }) else {
-                        continue;
+                    }
+                    let Some(ft) = state
+                        .params
+                        .try_ft_from_remote_address(&other_addr, self.guest_port)
+                    else {
+                        return;
                     };
 
+                    let packet_len = build_udp_packet(
+                        &mut eth,
+                        ft.src.ip().into(),
+                        ft.dst.ip().into(),
+                        ft.src.port(),
+                        ft.dst.port(),
+                        n,
+                        state.params.gateway_mac,
+                        state.params.client_mac,
+                    );
+                    let checksum_state = match other_addr {
+                        SocketAddr::V4(_) => ChecksumState::UDP4,
+                        SocketAddr::V6(_) => ChecksumState::NONE,
+                    };
                     client.recv(&eth.as_ref()[..packet_len], &checksum_state);
                     self.stats.rx_packets.increment();
                 }
@@ -363,7 +312,12 @@ impl<T: Client> Access<'_, T> {
         });
 
         for listener in self.inner.udp.listeners.values_mut() {
-            listener.poll_listener(cx, &mut self.inner.state, self.client);
+            listener.poll_listener(
+                cx,
+                &mut self.inner.state,
+                self.client,
+                &self.inner.udp.connections,
+            );
         }
 
         while let Some(response) =
@@ -428,7 +382,7 @@ impl<T: Client> Access<'_, T> {
         let udp_packet = UdpPacket::new_checked(payload)?;
 
         // Parse UDP header and check gateway handling
-        let (guest_addr, dst_sock_addr) = match addresses {
+        let (guest_addr, mut dst_sock_addr) = match addresses {
             IpAddresses::V4(addrs) => {
                 let udp = UdpRepr::parse(
                     &udp_packet,
@@ -478,6 +432,14 @@ impl<T: Client> Access<'_, T> {
                 (guest_addr, dst_sock_addr)
             }
         };
+
+        if self.inner.state.params.is_local_address(&dst_sock_addr) {
+            // This packet is destined for a local address. Check if we have a listener
+            // for the destination port and, if so, switch to the corresponding host port.
+            if let Some(listener) = self.inner.udp.listeners.get(&dst_sock_addr.port()) {
+                dst_sock_addr.set_port(listener.host_port);
+            }
+        }
 
         let conn = self.get_or_insert(guest_addr, None, Some(frame.src_addr))?;
         let socket = conn.socket.as_ref().unwrap().get();
@@ -530,8 +492,18 @@ impl<T: Client> Access<'_, T> {
                 let socket = UdpSocket::bind(bind_addr).map_err(DropReason::Io)?;
                 let socket =
                     PolledSocket::new(self.client.driver(), socket).map_err(DropReason::Io)?;
+                let host_port = match host_port {
+                    Some(port) => port,
+                    None => {
+                        socket2::SockAddr::from(socket.get().local_addr().map_err(DropReason::Io)?)
+                            .as_socket()
+                            .unwrap()
+                            .port()
+                    }
+                };
                 let conn = UdpConnection {
                     socket: Some(socket),
+                    host_port,
                     guest_mac: guest_mac.unwrap_or(self.inner.state.params.client_mac),
                     stats: Default::default(),
                     recycle: false,
@@ -594,10 +566,12 @@ impl<T: Client> Access<'_, T> {
         }
         let socket: UdpSocket = socket.into();
         let socket = PolledSocket::new(self.client.driver(), socket).map_err(BindError::Io)?;
+        let host_port = socket.get().local_addr().map_err(BindError::Io)?.port();
         self.inner.udp.listeners.insert(
             guest_port,
             UdpListener {
                 socket: Some(socket),
+                host_port,
                 guest_port,
                 stats: Default::default(),
             },
