@@ -903,11 +903,27 @@ impl<T: Client> Access<'_, T> {
         }
 
         let next_header = ipv6.next_header();
+        let src_addr = ipv6.src_addr();
         let inner = &payload[smoltcp::wire::IPV6_HEADER_LEN..];
         let addresses = Ipv6Addresses {
-            src_addr: ipv6.src_addr(),
+            src_addr,
             dst_addr: ipv6.dst_addr(),
         };
+
+        // Learn the client's routable IPv6 address from outgoing traffic.
+        // This is more reliable than relying solely on DAD Neighbor
+        // Solicitations, which some clients skip on private virtual links.
+        if !src_addr.is_unspecified()
+            && !src_addr.is_multicast()
+            && !src_addr.is_unicast_link_local()
+            && self.inner.state.params.client_ip_ipv6_routable != Some(src_addr)
+        {
+            tracing::debug!(
+                client_ipv6_routable = %src_addr,
+                "learned client routable IPv6 address from outgoing traffic"
+            );
+            self.inner.state.params.client_ip_ipv6_routable = Some(src_addr);
+        }
 
         match next_header {
             IpProtocol::Udp => {
