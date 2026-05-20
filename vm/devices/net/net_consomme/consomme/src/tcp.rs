@@ -282,6 +282,7 @@ impl<T: Client> Access<'_, T> {
                                         return true;
                                     }
                                 };
+                                tracing::info!(?ft, "TCP connection established");
                                 e.insert(conn);
                             }
                             hash_map::Entry::Occupied(_) => {
@@ -863,6 +864,7 @@ impl TcpConnectionInner {
         // Wait for the outbound connection to complete.
         if self.state == TcpState::Connecting {
             let Some(socket) = opt_socket.as_mut() else {
+                tracing::warn!("Forgot the opt_socket");
                 return false;
             };
             match socket.poll_ready(cx, PollEvents::OUT) {
@@ -1012,7 +1014,7 @@ impl TcpConnectionInner {
             // Avoid resetting so that the guest doesn't think there is a
             // responding TCP stack at this address. The guest will time out on
             // its own.
-            tracing::debug!(
+            tracing::warn!(
                 src = %sender.ft.src,
                 dst = %sender.ft.dst,
                 error = &err as &dyn std::error::Error,
@@ -1276,7 +1278,7 @@ impl TcpConnectionInner {
             }
 
             // This is a valid RST. Drop the connection.
-            tracing::debug!("connection reset");
+            tracing::info!("connection reset");
             return Ok(false);
         }
 
@@ -1289,7 +1291,7 @@ impl TcpConnectionInner {
         // SYN should not be set for in-window segments.
         if tcp.control == TcpControl::Syn {
             if self.state == TcpState::SynReceived {
-                tracing::debug!("invalid syn, drop connection");
+                tracing::warn!("invalid syn, drop connection");
                 return Ok(false);
             }
             // RFC 5961, send a challenge ACK.
@@ -1539,7 +1541,7 @@ fn take_socket_error(socket: &PolledSocket<Socket>) -> io::Error {
 fn log_connect_error(ft: &FourTuple, err: &io::Error) {
     match err.kind() {
         ErrorKind::ConnectionRefused => {
-            tracing::debug!(
+            tracing::warn!(
                 error = err as &dyn std::error::Error,
                 src = %ft.src,
                 dst = %ft.dst,
