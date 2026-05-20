@@ -167,10 +167,12 @@ impl UdpConnection {
                 },
             ) {
                 Poll::Ready(Ok((n, src_addr))) => {
-                    let ft = match state
-                        .params
-                        .try_ft_from_remote_address(&src_addr, dst_addr.port())
-                    {
+                    let ft = match ConsommeState::translate_remote_address(
+                        &state.params,
+                        &mut state.local_addr_map,
+                        &src_addr,
+                        dst_addr.port(),
+                    ) {
                         Some(ft) => ft,
                         None => FourTuple {
                             src: src_addr,
@@ -254,13 +256,19 @@ impl UdpListener {
                             }
                         }
                     }
-                    let Some(ft) = state
-                        .params
-                        .try_ft_from_remote_address(&other_addr, self.guest_port)
-                    else {
+                    let Some(ft) = ConsommeState::translate_remote_address(
+                        &state.params,
+                        &mut state.local_addr_map,
+                        &other_addr,
+                        self.guest_port,
+                    ) else {
                         continue;
                     };
-                    tracing::info!(?other_addr, guest_port = self.guest_port, "Received UDP packet on listener");
+                    tracing::info!(
+                        ?other_addr,
+                        guest_port = self.guest_port,
+                        "Received UDP packet on listener"
+                    );
                     let packet_len = build_udp_packet(
                         &mut eth,
                         ft.src.ip().into(),
@@ -382,7 +390,7 @@ impl<T: Client> Access<'_, T> {
         let udp_packet = UdpPacket::new_checked(payload)?;
 
         // Parse UDP header and check gateway handling
-        let (guest_addr, mut dst_sock_addr) = match addresses {
+        let (guest_addr, dst_sock_addr) = match addresses {
             IpAddresses::V4(addrs) => {
                 let udp = UdpRepr::parse(
                     &udp_packet,
@@ -432,6 +440,9 @@ impl<T: Client> Access<'_, T> {
                 (guest_addr, dst_sock_addr)
             }
         };
+
+        // Resolve virtual mapped addresses back to the real host address.
+        let mut dst_sock_addr = self.inner.state.resolve_destination(&dst_sock_addr);
 
         if self.inner.state.params.is_local_address(&dst_sock_addr) {
             // This packet is destined for a local address. Check if we have a listener

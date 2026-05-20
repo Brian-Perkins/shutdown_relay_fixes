@@ -247,7 +247,7 @@ impl<T: Client> Access<'_, T> {
                                 }
                             }
                         }
-                        let Some(ft) = self.inner.state.params.try_ft_from_remote_address(&other_addr, *port) else {
+                        let Some(ft) = self.inner.state.try_ft_from_remote_address(&other_addr, *port) else {
                             return true;
                         };
                         tracing::info!(?ft, "New TCP connection accepted");
@@ -415,16 +415,24 @@ impl<T: Client> Access<'_, T> {
                             &self.inner.tcp.connection_params,
                         )?
                     } else {
+                        // Resolve virtual mapped addresses back to real host
+                        // addresses before establishing the connection.
+                        let resolved_dst = sender.state.resolve_destination(&sender.ft.dst);
                         // If this is directed to a local port owned by the guest, use the
                         // appropriate host port substitution.
-                        let is_local_address = sender.state.params.is_local_address(&sender.ft.dst);
+                        let is_local_address = sender.state.params.is_local_address(&resolved_dst);
                         let ft = if is_local_address
                             && let Some(listener) =
-                                self.inner.tcp.listeners.get(&sender.ft.dst.port())
+                                self.inner.tcp.listeners.get(&resolved_dst.port())
                         {
                             FourTuple {
                                 src: sender.ft.src,
-                                dst: SocketAddr::new(sender.ft.dst.ip(), listener.host_port),
+                                dst: SocketAddr::new(resolved_dst.ip(), listener.host_port),
+                            }
+                        } else if resolved_dst != sender.ft.dst {
+                            FourTuple {
+                                src: sender.ft.src,
+                                dst: resolved_dst,
                             }
                         } else {
                             ft

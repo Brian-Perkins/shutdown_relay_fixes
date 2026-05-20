@@ -22,6 +22,7 @@ mod dhcpv6;
 mod dns;
 mod dns_resolver;
 mod icmp;
+mod local_addr_map;
 mod ndp;
 mod tcp;
 mod udp;
@@ -50,6 +51,7 @@ use smoltcp::wire::Ipv4Address;
 use smoltcp::wire::Ipv4Packet;
 use smoltcp::wire::Ipv6Address;
 use smoltcp::wire::Ipv6Packet;
+use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use std::net::SocketAddrV4;
 use std::net::SocketAddrV6;
@@ -87,6 +89,7 @@ struct ConsommeState {
     params: ConsommeParams,
     #[inspect(skip)]
     buffer: Box<[u8]>,
+    local_addr_map: local_addr_map::LocalAddrMap,
 }
 
 /// Dynamic networking properties of a consomme endpoint.
@@ -273,24 +276,43 @@ impl ConsommeParams {
             }
         }
     }
+}
 
+impl ConsommeState {
     fn try_ft_from_remote_address(
-        &self,
+        &mut self,
+        remote_addr: &SocketAddr,
+        dst_port: u16,
+    ) -> Option<FourTuple> {
+        Self::translate_remote_address(
+            &self.params,
+            &mut self.local_addr_map,
+            remote_addr,
+            dst_port,
+        )
+    }
+
+    /// Core translation logic, split out to allow calling when `buffer` is
+    /// borrowed (callers can pass `&state.params` and
+    /// `&mut state.local_addr_map` individually).
+    fn translate_remote_address(
+        params: &ConsommeParams,
+        local_addr_map: &mut local_addr_map::LocalAddrMap,
         remote_addr: &SocketAddr,
         dst_port: u16,
     ) -> Option<FourTuple> {
         // Pick the best destination (guest) address based on the origination of the remote packet.
         let dst = match remote_addr {
-            SocketAddr::V4(_) => SocketAddr::V4(SocketAddrV4::new(self.client_ip, dst_port)),
+            SocketAddr::V4(_) => SocketAddr::V4(SocketAddrV4::new(params.client_ip, dst_port)),
             SocketAddr::V6(v6) => {
                 // Pick the best local IPv6 address based on the remote IP.
                 let client_ipv6 = if !v6.ip().is_unicast_link_local()
-                    && let Some(routable) = self.client_ip_ipv6_routable
+                    && let Some(routable) = params.client_ip_ipv6_routable
                 {
                     routable
-                } else if let Some(ipv6) = self.client_ip_ipv6 {
+                } else if let Some(ipv6) = params.client_ip_ipv6 {
                     ipv6
-                } else if let Some(routable) = self.client_ip_ipv6_routable {
+                } else if let Some(routable) = params.client_ip_ipv6_routable {
                     routable
                 } else {
                     tracelimit::warn_ratelimited!(addr = %remote_addr, "Client IPv6 address is not known, dropping packet");
@@ -302,15 +324,48 @@ impl ConsommeParams {
         };
 
         // If the remote IP is loopback or matches the client IP address, replace
-        // it with the gateway IP so that the guest's reply routes back through the
-        // virtual adapter instead of its own loopback interface.
+        // it with a unique virtual address so that the guest routes the reply
+        // back through the virtual adapter and we can reverse-translate it on the
+        // outgoing path.
         let src = match remote_addr {
-            SocketAddr::V4(v4) if self.is_local_address(remote_addr) => {
-                SocketAddr::V4(SocketAddrV4::new(self.gateway_ip, v4.port()))
+            SocketAddr::V4(v4) if params.is_local_address(remote_addr) => {
+                let subnet_base =
+                    Ipv4Addr::from(u32::from(params.gateway_ip) & u32::from(params.net_mask));
+                let virtual_ip = local_addr_map.get_or_allocate_v4(
+                    *v4.ip(),
+                    subnet_base,
+                    params.net_mask,
+                    params.gateway_ip,
+                    params.client_ip,
+                );
+                match virtual_ip {
+                    Some(ip) => SocketAddr::V4(SocketAddrV4::new(ip, v4.port())),
+                    None => {
+                        // Pool exhausted, fall back to gateway IP.
+                        SocketAddr::V4(SocketAddrV4::new(params.gateway_ip, v4.port()))
+                    }
+                }
             }
-            SocketAddr::V6(v6) if self.is_local_address(remote_addr) => SocketAddr::V6(
-                SocketAddrV6::new(self.gateway_link_local_ipv6, v6.port(), 0, 0),
-            ),
+            SocketAddr::V6(v6) if params.is_local_address(remote_addr) => {
+                let virtual_ip = local_addr_map.get_or_allocate_v6(
+                    *v6.ip(),
+                    params.gateway_link_local_ipv6,
+                    params.client_ip_ipv6,
+                    params.client_ip_ipv6_routable,
+                );
+                match virtual_ip {
+                    Some(ip) => SocketAddr::V6(SocketAddrV6::new(ip, v6.port(), 0, 0)),
+                    None => {
+                        // Pool exhausted, fall back to gateway link-local.
+                        SocketAddr::V6(SocketAddrV6::new(
+                            params.gateway_link_local_ipv6,
+                            v6.port(),
+                            0,
+                            0,
+                        ))
+                    }
+                }
+            }
             SocketAddr::V6(v6) => {
                 // Remove flow info and scope id from the source address.
                 SocketAddr::V6(SocketAddrV6::new(*v6.ip(), v6.port(), 0, 0))
@@ -319,6 +374,18 @@ impl ConsommeParams {
         };
 
         Some(FourTuple { src, dst })
+    }
+
+    /// Resolve a destination address that the guest is sending to. If it is a
+    /// virtual mapped address, return the real host address. Otherwise return
+    /// the address unchanged.
+    fn resolve_destination(&self, addr: &SocketAddr) -> SocketAddr {
+        let ip = addr.ip();
+        if let Some(real_ip) = self.local_addr_map.resolve_virtual(&ip) {
+            SocketAddr::new(real_ip, addr.port())
+        } else {
+            *addr
+        }
     }
 }
 
@@ -625,6 +692,7 @@ impl Consomme {
             state: ConsommeState {
                 params,
                 buffer: Box::new([0; 65536]),
+                local_addr_map: local_addr_map::LocalAddrMap::new(),
             },
             tcp: tcp::Tcp::new(),
             udp: udp::Udp::new(timeout),
@@ -640,6 +708,16 @@ impl Consomme {
     /// changed at runtime.
     pub fn params_mut(&mut self) -> &mut ConsommeParams {
         &mut self.state.params
+    }
+
+    /// Clears the local address mapping table. Call this after changing the
+    /// network configuration (e.g., via [`ConsommeParams::set_cidr`]) to avoid
+    /// stale or conflicting virtual address mappings.
+    ///
+    /// Some in-flight packets may be lost during the transition; this is
+    /// acceptable.
+    pub fn clear_local_addr_map(&mut self) {
+        self.state.local_addr_map.clear();
     }
 
     /// Pairs the client with this instance to operate on the consomme instance.
