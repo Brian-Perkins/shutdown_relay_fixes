@@ -241,9 +241,9 @@ impl<T: Client> Access<'_, T> {
                                     if let LoopbackPortInfo::ProxyForGuestPort{sending_port, guest_port} = connection.inner.loopback_port {
                                         if sending_port == other_addr.port() {
                                             other_addr.set_port(guest_port);
-                                            break;
                                         }
                                     }
+                                    break;
                                 }
                             }
                         }
@@ -319,7 +319,12 @@ impl<T: Client> Access<'_, T> {
                     }
                 },
                 TcpBackend::Socket(opt_socket) => {
-                    conn.inner.poll_socket_backend(cx, &mut sender, opt_socket)
+                    if conn.inner.poll_socket_backend(cx, &mut sender, opt_socket) {
+                        true
+                    } else {
+                        tracing::info!(?ft, "poll_socket_backend returned false");
+                        false
+                    }
                 }
             }
         });
