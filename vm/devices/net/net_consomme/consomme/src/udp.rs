@@ -258,7 +258,7 @@ impl UdpListener {
                         .params
                         .try_ft_from_remote_address(&other_addr, self.guest_port)
                     else {
-                        return;
+                        continue;
                     };
 
                     let packet_len = build_udp_packet(
@@ -494,12 +494,7 @@ impl<T: Client> Access<'_, T> {
                     PolledSocket::new(self.client.driver(), socket).map_err(DropReason::Io)?;
                 let host_port = match host_port {
                     Some(port) => port,
-                    None => {
-                        socket2::SockAddr::from(socket.get().local_addr().map_err(DropReason::Io)?)
-                            .as_socket()
-                            .unwrap()
-                            .port()
-                    }
+                    None => socket.get().local_addr().map_err(DropReason::Io)?.port(),
                 };
                 let conn = UdpConnection {
                     socket: Some(socket),

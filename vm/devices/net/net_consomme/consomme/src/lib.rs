@@ -266,14 +266,10 @@ impl ConsommeParams {
             SocketAddr::V4(v4) => v4.ip().is_loopback() || v4.ip() == &self.client_ip,
             SocketAddr::V6(v6) => {
                 v6.ip().is_loopback()
-                    || v6.ip()
-                        == &self
-                            .client_ip_ipv6
-                            .unwrap_or(::std::net::Ipv6Addr::UNSPECIFIED)
-                    || v6.ip()
-                        == &self
-                            .client_ip_ipv6_routable
-                            .unwrap_or(::std::net::Ipv6Addr::UNSPECIFIED)
+                    || self.client_ip_ipv6.is_some_and(|ip| v6.ip() == &ip)
+                    || self
+                        .client_ip_ipv6_routable
+                        .is_some_and(|ip| v6.ip() == &ip)
             }
         }
     }
@@ -546,20 +542,41 @@ impl IpAddresses {
     }
 }
 
-impl From<FourTuple> for IpAddresses {
-    fn from(ft: FourTuple) -> Self {
+impl TryFrom<FourTuple> for IpAddresses {
+    type Error = DropReason;
+
+    fn try_from(ft: FourTuple) -> Result<Self, Self::Error> {
         match (ft.src, ft.dst) {
-            (SocketAddr::V4(src), SocketAddr::V4(dst)) => IpAddresses::V4(Ipv4Addresses {
+            (SocketAddr::V4(src), SocketAddr::V4(dst)) => Ok(IpAddresses::V4(Ipv4Addresses {
                 src_addr: *src.ip(),
                 dst_addr: *dst.ip(),
-            }),
-            (SocketAddr::V6(src), SocketAddr::V6(dst)) => IpAddresses::V6(Ipv6Addresses {
+            })),
+            (SocketAddr::V6(src), SocketAddr::V6(dst)) => Ok(IpAddresses::V6(Ipv6Addresses {
                 src_addr: *src.ip(),
                 dst_addr: *dst.ip(),
-            }),
-            _ => panic!("invalid four-tuple with mixed IP versions"),
+            })),
+            _ => Err(DropReason::MalformedPacket),
         }
     }
+}
+
+/// Returns `true` if two IPv4 addresses are in the same subnet given a mask.
+pub(crate) fn is_same_ipv4_subnet(
+    addr1: Ipv4Address,
+    addr2: Ipv4Address,
+    subnet_mask: Ipv4Address,
+) -> bool {
+    let subnet_mask = subnet_mask.to_bits();
+    (addr1.to_bits() & subnet_mask) == (addr2.to_bits() & subnet_mask)
+}
+
+/// Returns `true` if two IPv6 addresses share the same prefix of the given length.
+pub(crate) fn is_same_ipv6_subnet(addr1: Ipv6Address, addr2: Ipv6Address, prefix_len: u8) -> bool {
+    if prefix_len == 0 {
+        return true;
+    }
+    let mask = u128::MAX << (128 - prefix_len);
+    (addr1.to_bits() & mask) == (addr2.to_bits() & mask)
 }
 
 /// Returns `true` if the given IPv6 address is a globally routable unicast

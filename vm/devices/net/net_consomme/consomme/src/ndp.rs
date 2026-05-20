@@ -14,6 +14,7 @@ use super::Client;
 use super::DropReason;
 use crate::ChecksumState;
 use crate::MIN_MTU;
+use crate::is_same_ipv6_subnet;
 use smoltcp::phy::Medium;
 use smoltcp::wire::EthernetAddress;
 use smoltcp::wire::EthernetFrame;
@@ -61,14 +62,6 @@ fn rdnss_option_size(num_servers: usize) -> usize {
     } else {
         8 + 16 * num_servers // 8-byte header + 16 bytes per IPv6 address
     }
-}
-
-fn is_same_subnet(addr1: Ipv6Address, addr2: Ipv6Address, prefix_len: u8) -> bool {
-    if prefix_len == 0 {
-        return true;
-    }
-    let mask = u128::MAX << (128 - prefix_len);
-    (addr1.to_bits() & mask) == (addr2.to_bits() & mask)
 }
 
 #[derive(Debug)]
@@ -185,8 +178,9 @@ impl<T: Client> Access<'_, T> {
             .compute_network_prefix(NETWORK_PREFIX_BASE, self.inner.state.params.prefix_len_ipv6);
 
         // RFC 4861 Section 4.6.2: Router Advertisement with Prefix Information
-        // We set the ADDRCONF flag to enable SLAAC and ON_LINK flag to indicate
-        // that addresses with this prefix are on-link.
+        // We set the ADDRCONF flag to enable SLAAC. We intentionally omit ON_LINK
+        // so the guest treats global addresses as off-link and routes all traffic
+        // through the gateway rather than attempting on-link NDP resolution.
         let ndp_repr = NdiscRepr::RouterAdvert {
             hop_limit: 255,
             flags: NdiscRouterFlags::empty(),
@@ -202,7 +196,7 @@ impl<T: Client> Access<'_, T> {
                 prefix,
                 valid_lifetime: smoltcp::time::Duration::from_secs(2592000), // https://www.rfc-editor.org/rfc/rfc4861#section-6.2.1
                 preferred_lifetime: smoltcp::time::Duration::from_secs(604800), // https://www.rfc-editor.org/rfc/rfc4861#section-6.2.1
-                flags: NdiscPrefixInfoFlags::ON_LINK | NdiscPrefixInfoFlags::ADDRCONF,
+                flags: NdiscPrefixInfoFlags::ADDRCONF,
             }),
         };
 
@@ -283,7 +277,9 @@ impl<T: Client> Access<'_, T> {
 
         // RFC 4862 Section 5.4.3: Handle Duplicate Address Detection (DAD)
         // If source is unspecified (::), this is DAD - we should NOT respond
-        // to avoid interfering with the client's address configuration
+        // to avoid interfering with the client's address configuration.
+        // We learn the client's address here because consomme is the only other
+        // entity on this virtual link, so DAD will always succeed.
         if ipv6_src_addr.is_unspecified() {
             if target_addr.is_unicast_link_local() {
                 self.inner.state.params.client_ip_ipv6 = Some(target_addr);
@@ -335,7 +331,7 @@ impl<T: Client> Access<'_, T> {
         // For any addresses in the subnet given to the guest, provide the gateway MAC address.
         // This is the standard mechanism to indicate all traffic flows through the gateway, even
         // local subnet traffic.
-        if !is_same_subnet(
+        if !is_same_ipv6_subnet(
             self.inner.state.params.gateway_link_local_ipv6,
             target_addr,
             self.inner.state.params.prefix_len_ipv6,

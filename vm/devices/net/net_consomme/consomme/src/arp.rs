@@ -5,19 +5,14 @@ use super::Access;
 use super::Client;
 use super::DropReason;
 use crate::ChecksumState;
-use crate::Ipv4Address;
 use crate::MIN_MTU;
+use crate::is_same_ipv4_subnet;
 use smoltcp::wire::ArpOperation;
 use smoltcp::wire::ArpPacket;
 use smoltcp::wire::ArpRepr;
 use smoltcp::wire::EthernetFrame;
 use smoltcp::wire::EthernetProtocol;
 use smoltcp::wire::EthernetRepr;
-
-fn is_same_subnet(addr1: Ipv4Address, addr2: Ipv4Address, subnet_mask: Ipv4Address) -> bool {
-    let subnet_mask = subnet_mask.to_bits();
-    (addr1.to_bits() & subnet_mask) == (addr2.to_bits() & subnet_mask)
-}
 
 impl<T: Client> Access<'_, T> {
     pub(crate) fn handle_arp(
@@ -41,7 +36,7 @@ impl<T: Client> Access<'_, T> {
         // This is the standard mechanism to indicate all traffic flows through the gateway, even
         // local subnet traffic.
         if self.inner.state.params.client_ip == target_protocol_addr
-            || !is_same_subnet(
+            || !is_same_ipv4_subnet(
                 self.inner.state.params.gateway_ip,
                 target_protocol_addr,
                 self.inner.state.params.net_mask,
