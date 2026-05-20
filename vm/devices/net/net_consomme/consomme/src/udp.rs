@@ -260,7 +260,7 @@ impl UdpListener {
                     else {
                         continue;
                     };
-
+                    tracing::info!(?other_addr, guest_port = self.guest_port, "Received UDP packet on listener");
                     let packet_len = build_udp_packet(
                         &mut eth,
                         ft.src.ip().into(),
@@ -448,6 +448,7 @@ impl<T: Client> Access<'_, T> {
                 .map_err(DropReason::Io)?;
             conn.gso_size = checksum.gso;
         }
+        tracing::info!(?dst_sock_addr, guest_addr = %guest_addr, "Sending UDP packet");
         let result = platform::send_to(socket, udp_packet.payload(), &dst_sock_addr, checksum.gso);
         match result {
             Ok(_) => {
