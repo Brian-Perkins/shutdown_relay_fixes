@@ -294,6 +294,9 @@ impl<T: Client> Access<'_, T> {
                             }
                         }
                     }
+                    for ft in self.inner.tcp.connections.keys() {
+                        tracing::info!(?ft, "Existing connection");
+                    }
                     true
                 }
                 Err(_) => false,
@@ -319,7 +322,11 @@ impl<T: Client> Access<'_, T> {
                     conn.inner.poll_socket_backend(cx, &mut sender, opt_socket)
                 }
             }
-        })
+        });
+        tracing::info!("exiting poll_tcp");
+        for ft in self.inner.tcp.connections.keys() {
+            tracing::info!(?ft, "Existing connection");
+        }
     }
 
     pub(crate) fn refresh_tcp_driver(&mut self) {
@@ -348,6 +355,10 @@ impl<T: Client> Access<'_, T> {
                 }
             }
         });
+        tracing::info!("exiting refresh_tcp_driver");
+        for ft in self.inner.tcp.connections.keys() {
+            tracing::info!(?ft, "Existing connection");
+        }
     }
 
     pub(crate) fn handle_tcp(
@@ -396,6 +407,7 @@ impl<T: Client> Access<'_, T> {
             hash_map::Entry::Occupied(mut e) => {
                 let keep = e.get_mut().inner.handle_packet(&mut sender, &tcp)?;
                 if !keep {
+                    tracing::info!(?ft, "Closing TCP connection");
                     let dns_in_flight = matches!(
                         e.get().backend,
                         TcpBackend::Dns(ref h) if h.is_in_flight()
