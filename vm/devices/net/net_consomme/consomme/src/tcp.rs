@@ -384,6 +384,13 @@ impl<T: Client> Access<'_, T> {
             state: &mut self.inner.state,
         };
 
+        if !self.inner.tcp.connections.contains_key(&ft) {
+            tracing::info!(?ft, "Non-existent connection");
+            for ft in self.inner.tcp.connections.keys() {
+                tracing::info!(?ft, "Existing connection");
+            }
+        }
+
         match self.inner.tcp.connections.entry(ft) {
             hash_map::Entry::Occupied(mut e) => {
                 let keep = e.get_mut().inner.handle_packet(&mut sender, &tcp)?;
