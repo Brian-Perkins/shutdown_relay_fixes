@@ -27,6 +27,8 @@ use pal_async::driver::Driver;
 use pal_async::interest::PollEvents;
 use pal_async::socket::PollReady;
 use pal_async::socket::PolledSocket;
+use pal_async::timer::Instant as TimerInstant;
+use pal_async::timer::PolledTimer as TcpTimer;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::ETHERNET_HEADER_LEN;
 use smoltcp::wire::EthernetFrame;
@@ -61,6 +63,7 @@ use std::net::SocketAddrV6;
 use std::pin::Pin;
 use std::task::Context;
 use std::task::Poll;
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(InspectMut)]
@@ -84,6 +87,8 @@ struct TcpAggregateStats {
     connections_closed_peer_rst: Counter,
     /// Connections closed due to local errors (socket failures, invalid handshake).
     connections_closed_local_error: Counter,
+    /// Connections reaped after the peer did not finish the shutdown handshake.
+    connections_closed_timeout: Counter,
 }
 
 impl TcpAggregateStats {
@@ -93,6 +98,10 @@ impl TcpAggregateStats {
             ConnectionCloseReason::PeerRst => self.connections_closed_peer_rst.increment(),
             ConnectionCloseReason::LocalError => self.connections_closed_local_error.increment(),
         }
+    }
+
+    fn record_timeout_close(&mut self) {
+        self.connections_closed_timeout.increment();
     }
 }
 
@@ -241,6 +250,15 @@ struct TcpConnectionInner {
     loopback_port: LoopbackPortInfo,
     state: TcpState,
 
+    /// Deadline at which a connection in a half-closed state (`FinWait1`,
+    /// `FinWait2`, `Closing`, `LastAck`, or `TimeWait`) should be forcibly
+    /// reclaimed.
+    #[inspect(with = "|x| x.is_some()")]
+    close_deadline: Option<TimerInstant>,
+    #[inspect(skip)]
+    timer: Option<TcpTimer>,
+    retransmission: RetransmissionState,
+
     #[inspect(with = "|x| x.len()")]
     rx_buffer: ring::Ring,
     #[inspect(hex)]
@@ -291,6 +309,121 @@ struct TcpConnectionInner {
     #[inspect(skip)]
     last_close_reason: ConnectionCloseReason,
     stats: TcpConnStats,
+}
+
+const INITIAL_RTO: Duration = Duration::from_secs(1);
+const MIN_RTO: Duration = Duration::from_secs(1);
+const MAX_RTO: Duration = Duration::from_secs(60);
+const CLOCK_GRANULARITY: Duration = Duration::from_millis(1);
+
+#[derive(Inspect)]
+struct RetransmissionState {
+    #[inspect(debug)]
+    rto: Duration,
+    #[inspect(with = "|x| x.is_some()")]
+    deadline: Option<TimerInstant>,
+    #[inspect(debug)]
+    srtt: Option<Duration>,
+    #[inspect(debug)]
+    rttvar: Option<Duration>,
+    #[inspect(skip)]
+    sample: Option<RttSample>,
+    syn_retransmitted: bool,
+}
+
+struct RttSample {
+    sequence_end: TcpSeqNumber,
+    sent_at: TimerInstant,
+}
+
+impl RetransmissionState {
+    fn new() -> Self {
+        Self {
+            rto: INITIAL_RTO,
+            deadline: None,
+            srtt: None,
+            rttvar: None,
+            sample: None,
+            syn_retransmitted: false,
+        }
+    }
+
+    fn on_send(&mut self, sequence_end: TcpSeqNumber, now: TimerInstant) {
+        if self.deadline.is_none() {
+            self.deadline = Some(now + self.rto);
+        }
+        if self.sample.is_none() {
+            self.sample = Some(RttSample {
+                sequence_end,
+                sent_at: now,
+            });
+        }
+    }
+
+    fn on_ack(&mut self, ack_number: TcpSeqNumber, tx_send: TcpSeqNumber, now: TimerInstant) {
+        if self
+            .sample
+            .as_ref()
+            .is_some_and(|sample| ack_number >= sample.sequence_end)
+        {
+            let sample = self.sample.take().expect("sample was checked");
+            self.update_rto(now.saturating_sub(sample.sent_at));
+        }
+
+        self.deadline = (ack_number < tx_send).then_some(now + self.rto);
+    }
+
+    fn on_retransmit(&mut self, now: TimerInstant) {
+        // Karn's algorithm: an ACK after a retransmission is ambiguous and
+        // cannot be used as an RTT sample.
+        self.sample = None;
+        self.rto = self.rto.saturating_mul(2).min(MAX_RTO);
+        self.deadline = Some(now + self.rto);
+    }
+
+    fn on_syn_retransmit(&mut self) {
+        self.syn_retransmitted = true;
+    }
+
+    fn on_handshake_complete(&mut self) {
+        // RFC 6298 section 5.7 requires at least a 3-second RTO for data
+        // after a SYN retransmission when the backed-off RTO is smaller.
+        if self.syn_retransmitted {
+            self.rto = self.rto.max(Duration::from_secs(3));
+            self.syn_retransmitted = false;
+        }
+    }
+
+    fn update_rto(&mut self, sample: Duration) {
+        if let (Some(srtt), Some(rttvar)) = (self.srtt, self.rttvar) {
+            let error = srtt.abs_diff(sample);
+            let rttvar = duration_weighted_average(rttvar, 3, error, 1, 4);
+            let srtt = duration_weighted_average(srtt, 7, sample, 1, 8);
+            self.srtt = Some(srtt);
+            self.rttvar = Some(rttvar);
+        } else {
+            self.srtt = Some(sample);
+            self.rttvar = Some(sample / 2);
+        }
+
+        let srtt = self.srtt.expect("initialized above");
+        let variance = self
+            .rttvar
+            .expect("initialized above")
+            .saturating_mul(4)
+            .max(CLOCK_GRANULARITY);
+        self.rto = (srtt + variance).clamp(MIN_RTO, MAX_RTO);
+    }
+}
+
+fn duration_weighted_average(
+    a: Duration,
+    a_weight: u32,
+    b: Duration,
+    b_weight: u32,
+    divisor: u32,
+) -> Duration {
+    (a.saturating_mul(a_weight) + b.saturating_mul(b_weight)) / divisor
 }
 
 /// Why a connection was closed, for aggregate stats categorization.
@@ -356,6 +489,12 @@ struct TcpConnStats {
     tx_buffer_grows: Counter,
     /// Number of times the rx_buffer ring capacity was grown by autotune.
     rx_buffer_grows: Counter,
+    /// Retransmission timeouts.
+    retransmission_timeouts: Counter,
+    /// Segments retransmitted after an RTO.
+    retransmitted_segments: Counter,
+    /// Payload bytes retransmitted after an RTO.
+    retransmitted_bytes: Counter,
 }
 
 fn inspect_seq(seq: &TcpSeqNumber) -> inspect::AsHex<u32> {
@@ -503,7 +642,25 @@ impl<T: Client> Access<'_, T> {
                 state: &mut self.inner.state,
                 client: self.client,
             };
-            let keep = match &mut conn.backend {
+            if conn.inner.poll_timers(cx, &mut sender) {
+                tracing::debug!(
+                    src = %ft.src,
+                    dst = %ft.dst,
+                    state = ?conn.inner.state,
+                    "TCP close timer expired, reclaiming connection",
+                );
+                match conn.inner.state {
+                    TcpState::TimeWait => self
+                        .inner
+                        .tcp
+                        .aggregate_stats
+                        .record_close(ConnectionCloseReason::Normal),
+                    _ => self.inner.tcp.aggregate_stats.record_timeout_close(),
+                }
+                return false;
+            }
+
+            let mut keep = match &mut conn.backend {
                 TcpBackend::Dns(dns_handler) => {
                     if self.inner.dns.can_answer_queries() {
                         conn.inner.poll_dns_backend(
@@ -527,7 +684,22 @@ impl<T: Client> Access<'_, T> {
                     &self.inner.dns,
                 ),
             };
-            if !keep {
+            // The backend may have sent the first sequence-consuming segment
+            // in this poll. Poll once more to register its new RTO deadline
+            // with the async driver before returning Pending.
+            let timed_out = keep && conn.inner.poll_timers(cx, &mut sender);
+            if timed_out {
+                match conn.inner.state {
+                    TcpState::TimeWait => self
+                        .inner
+                        .tcp
+                        .aggregate_stats
+                        .record_close(ConnectionCloseReason::Normal),
+                    _ => self.inner.tcp.aggregate_stats.record_timeout_close(),
+                }
+                keep = false;
+            }
+            if !keep && !timed_out {
                 self.inner
                     .tcp
                     .aggregate_stats
@@ -539,6 +711,10 @@ impl<T: Client> Access<'_, T> {
 
     pub(crate) fn refresh_tcp_driver(&mut self) {
         self.inner.tcp.connections.retain(|ft, conn| {
+            // Timers, including those for DNS and socket-less closing
+            // connections, must move to the replacement async driver too.
+            conn.inner.timer = Some(TcpTimer::new(self.client.driver()));
+
             let TcpBackend::Socket {
                 socket: opt_socket, ..
             } = &mut conn.backend
@@ -897,6 +1073,9 @@ impl TcpConnection {
         TcpConnectionInner {
             loopback_port: LoopbackPortInfo::None,
             state: TcpState::Connecting,
+            close_deadline: None,
+            timer: None,
+            retransmission: RetransmissionState::new(),
             rx_buffer: ring::Ring::new(0),
             rx_window_cap: rx_bounds.initial,
             rx_window_scale,
@@ -933,6 +1112,7 @@ impl TcpConnection {
         inspect_static_dns: bool,
     ) -> Result<Self, DropReason> {
         let mut inner = Self::new_base(params);
+        inner.timer = Some(TcpTimer::new(sender.client.driver()));
         inner.initialize_from_first_client_packet(tcp)?;
 
         let socket = Socket::new(
@@ -1007,6 +1187,7 @@ impl TcpConnection {
             enable_window_scaling: true,
             ..Self::new_base(params)
         };
+        inner.timer = Some(TcpTimer::new(sender.client.driver()));
         inner.send_syn(sender, None);
         Ok(Self {
             backend: TcpBackend::Socket {
@@ -1028,6 +1209,7 @@ impl TcpConnection {
         params: &ConnectionParams,
     ) -> Result<Self, DropReason> {
         let mut inner = Self::new_base(params);
+        inner.timer = Some(TcpTimer::new(sender.client.driver()));
         inner.initialize_from_first_client_packet(tcp)?;
 
         let flow = crate::dns_resolver::DnsFlow {
@@ -1127,7 +1309,7 @@ impl TcpConnectionInner {
                     if n == 0 {
                         // EOF — close the connection.
                         if !self.state.tx_fin() {
-                            self.close();
+                            self.close(sender.state.params.tcp_close_timeout);
                         }
                         break;
                     }
@@ -1152,13 +1334,7 @@ impl TcpConnectionInner {
 
         // Flush any deferred pure-ACK from per-packet `handle_tcp` calls.
         self.send_next(sender, AckPolicy::Flush);
-        let closing = self.state == TcpState::TimeWait
-            || self.state == TcpState::LastAck
-            || (self.state.tx_fin() && self.state.rx_fin() && self.tx_buffer.is_empty());
-        if closing {
-            self.last_close_reason = ConnectionCloseReason::Normal;
-        }
-        !closing
+        true
     }
 
     /// Poll the real-socket TCP connection backend.
@@ -1236,7 +1412,7 @@ impl TcpConnectionInner {
                         match Pin::new(&mut *socket).poll_read_vectored(cx, &mut bufs) {
                             Poll::Ready(Ok(n)) => {
                                 if n == 0 {
-                                    self.close();
+                                    self.close(sender.state.params.tcp_close_timeout);
                                     break 'read;
                                 }
                                 if let Some(static_dns) = static_dns.as_mut() {
@@ -1595,6 +1771,8 @@ impl TcpConnectionInner {
 
         sender.send_packet(&tcp, None);
         self.tx_send += 1;
+        self.retransmission
+            .on_send(self.tx_send, TimerInstant::now());
         if ack_number.is_some() {
             // The guest reads the SYN-ACK window unscaled, so record that value.
             self.rx_window_last_adv = window_len as usize;
@@ -1720,6 +1898,9 @@ impl TcpConnectionInner {
             self.stats.bytes_tx_to_guest.add(payload_len as u64);
             self.stats.tx_segment_size.add_sample(payload_len as u64);
             self.tx_send = tx_next;
+            if tx_next > tcp.seq_number {
+                self.retransmission.on_send(tx_next, TimerInstant::now());
+            }
             self.needs_ack = false;
             self.record_advertised_window(window_len);
         }
@@ -1727,14 +1908,16 @@ impl TcpConnectionInner {
         assert!(self.tx_send <= tx_end);
     }
 
-    fn close(&mut self) {
+    fn close(&mut self, close_timeout: Duration) {
         tracing::trace!("fin");
         match self.state {
             TcpState::SynSent | TcpState::SynReceived | TcpState::Established => {
                 self.state = TcpState::FinWait1;
+                self.start_close_deadline(close_timeout);
             }
             TcpState::CloseWait => {
                 self.state = TcpState::LastAck;
+                self.start_close_deadline(close_timeout);
             }
             TcpState::Connecting
             | TcpState::FinWait1
@@ -1744,6 +1927,165 @@ impl TcpConnectionInner {
             | TcpState::LastAck => unreachable!("fin in {:?}", self.state),
         }
         self.tx_fin_buffered = true;
+    }
+
+    /// Start the user timeout for a graceful close. State transitions do not
+    /// extend it; outstanding data and FINs are retransmitted until it expires.
+    fn start_close_deadline(&mut self, close_timeout: Duration) {
+        if self.close_deadline.is_none() {
+            self.close_deadline = Some(TimerInstant::now() + close_timeout);
+        }
+    }
+
+    /// Start or restart the 2*MSL TIME-WAIT interval.
+    fn restart_time_wait(&mut self, close_timeout: Duration) {
+        self.close_deadline = Some(TimerInstant::now() + close_timeout);
+    }
+
+    /// Poll the retransmission and close timers. Returns `true` when the
+    /// connection's close timeout has expired.
+    fn poll_timers(&mut self, cx: &mut Context<'_>, sender: &mut Sender<'_, impl Client>) -> bool {
+        let Some(deadline) = [self.close_deadline, self.retransmission.deadline]
+            .into_iter()
+            .flatten()
+            .min()
+        else {
+            return false;
+        };
+
+        let poll = self
+            .timer
+            .as_mut()
+            .expect("runtime TCP connections always have a timer")
+            .poll_until(cx, deadline);
+        let Poll::Ready(now) = poll else {
+            return false;
+        };
+
+        if self.close_deadline.is_some_and(|deadline| now >= deadline) {
+            return true;
+        }
+
+        if self
+            .retransmission
+            .deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.stats.retransmission_timeouts.increment();
+            if self.retransmit_earliest(sender) {
+                self.retransmission.on_retransmit(now);
+            } else {
+                self.retransmission.deadline = Some(now + self.retransmission.rto);
+            }
+        }
+
+        if let Some(deadline) = [self.close_deadline, self.retransmission.deadline]
+            .into_iter()
+            .flatten()
+            .min()
+        {
+            let _ = self
+                .timer
+                .as_mut()
+                .expect("runtime TCP connections always have a timer")
+                .poll_until(cx, deadline);
+        }
+        false
+    }
+
+    /// Retransmit the earliest unacknowledged segment per RFC 6298 section 5.4.
+    fn retransmit_earliest(&mut self, sender: &mut Sender<'_, impl Client>) -> bool {
+        if self.tx_acked >= self.tx_send || sender.client.rx_mtu() == 0 {
+            return false;
+        }
+
+        if matches!(self.state, TcpState::SynSent | TcpState::SynReceived) {
+            let ack_number = (self.state == TcpState::SynReceived).then_some(self.rx_seq);
+            self.emit_syn(sender, self.tx_acked, ack_number);
+            self.retransmission.on_syn_retransmit();
+            self.stats.retransmitted_segments.increment();
+            return true;
+        }
+
+        let window_len = self.rx_window_len();
+        let tx_payload_end = self.tx_acked + self.tx_buffer.len();
+        let ip_header_len = match sender.ft.dst {
+            SocketAddr::V4(_) => IPV4_HEADER_LEN,
+            SocketAddr::V6(_) => IPV6_HEADER_LEN,
+        };
+        let tcp_header_len = 20;
+        let mtu = sender.client.rx_mtu().min(sender.state.buffer.len());
+        let max_payload = mtu.saturating_sub(ETHERNET_HEADER_LEN + ip_header_len + tcp_header_len);
+        let payload_len = (tx_payload_end - self.tx_acked)
+            .min(self.tx_mss)
+            .min(max_payload)
+            .min(self.tx_send - self.tx_acked);
+
+        let mut tcp = TcpRepr {
+            src_port: sender.ft.dst.port(),
+            dst_port: sender.ft.src.port(),
+            control: TcpControl::None,
+            seq_number: self.tx_acked,
+            ack_number: Some(self.rx_seq),
+            window_len,
+            window_scale: None,
+            max_seg_size: None,
+            sack_permitted: false,
+            sack_ranges: [None, None, None],
+            timestamp: None,
+            payload: &[],
+        };
+        let segment_end = self.tx_acked + payload_len;
+        if self.tx_fin_buffered && segment_end == tx_payload_end && segment_end < self.tx_send {
+            tcp.control = TcpControl::Fin;
+        } else if payload_len > 0 && segment_end == tx_payload_end {
+            tcp.control = TcpControl::Psh;
+        }
+
+        if payload_len == 0 && tcp.control != TcpControl::Fin {
+            return false;
+        }
+
+        trace_tcp_packet(sender.ft, &tcp, payload_len, "retransmit");
+        let payload = self.tx_buffer.view(0..payload_len);
+        sender.send_packet(&tcp, Some(payload));
+        self.stats.pkts_tx_to_guest.increment();
+        self.stats.bytes_tx_to_guest.add(payload_len as u64);
+        self.stats.tx_segment_size.add_sample(payload_len as u64);
+        self.stats.retransmitted_segments.increment();
+        self.stats.retransmitted_bytes.add(payload_len as u64);
+        self.record_advertised_window(window_len);
+        true
+    }
+
+    fn emit_syn(
+        &mut self,
+        sender: &mut Sender<'_, impl Client>,
+        sequence_number: TcpSeqNumber,
+        ack_number: Option<TcpSeqNumber>,
+    ) {
+        let window_scale = self.enable_window_scaling.then_some(self.rx_window_scale);
+        let window_len = if ack_number.is_some() {
+            self.rx_window_avail().min(u16::MAX as usize) as u16
+        } else {
+            0
+        };
+        let tcp = TcpRepr {
+            src_port: sender.ft.dst.port(),
+            dst_port: sender.ft.src.port(),
+            control: TcpControl::Syn,
+            seq_number: sequence_number,
+            ack_number,
+            window_len,
+            window_scale,
+            max_seg_size: Some(u16::MAX),
+            sack_permitted: false,
+            sack_ranges: [None, None, None],
+            timestamp: None,
+            payload: &[],
+        };
+        trace_tcp_packet(sender.ft, &tcp, 0, "retransmit");
+        sender.send_packet(&tcp, None);
     }
 
     /// Send an ACK using the current state of the connection.
@@ -1793,6 +2135,9 @@ impl TcpConnectionInner {
             return Ok(false);
         }
         self.tx_acked = ack_number;
+        self.retransmission
+            .on_ack(ack_number, self.tx_send, TimerInstant::now());
+        self.retransmission.on_handshake_complete();
 
         self.initialize_from_first_client_packet(tcp)?;
         self.tx_window_tx_seq = ack_number;
@@ -1822,6 +2167,18 @@ impl TcpConnectionInner {
         let rx_window_len = self.rx_window_cap - self.rx_buffer.len();
         let rx_window_end = self.rx_seq + rx_window_len;
         let segment_end = tcp.seq_number + tcp.segment_len();
+
+        // RFC 9293 section 3.10.7.4: ACK a retransmitted FIN in TIME-WAIT
+        // and restart the 2*MSL timer. The FIN is one byte to the left of
+        // RCV.NXT, so handle it before the normal sequence acceptability test.
+        if self.state == TcpState::TimeWait
+            && tcp.control == TcpControl::Fin
+            && segment_end == self.rx_seq
+        {
+            self.ack(sender);
+            self.restart_time_wait(sender.state.params.tcp_close_timeout);
+            return Ok(true);
+        }
 
         // Validate the sequence number per RFC 793.
         let seq_acceptable = if rx_window_len != 0 {
@@ -1873,6 +2230,7 @@ impl TcpConnectionInner {
 
         // ACK should always be set at this point.
         let ack_number = tcp.ack_number.ok_or(TcpError::MissingAck)?;
+        let previous_tx_acked = self.tx_acked;
 
         // FUTURE: validate ack number per RFC 5961.
 
@@ -1888,6 +2246,7 @@ impl TcpConnectionInner {
             self.tx_window_tx_seq = ack_number;
             self.tx_acked += 1;
             self.state = TcpState::Established;
+            self.retransmission.on_handshake_complete();
         }
 
         // Ignore ACKs for segments that have not been sent.
@@ -1903,8 +2262,13 @@ impl TcpConnectionInner {
                 self.tx_fin_buffered = false;
                 consumed -= 1;
                 match self.state {
-                    TcpState::FinWait1 => self.state = TcpState::FinWait2,
-                    TcpState::Closing => self.state = TcpState::TimeWait,
+                    TcpState::FinWait1 => {
+                        self.state = TcpState::FinWait2;
+                    }
+                    TcpState::Closing => {
+                        self.state = TcpState::TimeWait;
+                        self.restart_time_wait(sender.state.params.tcp_close_timeout);
+                    }
                     TcpState::LastAck => {
                         self.last_close_reason = ConnectionCloseReason::Normal;
                         return Ok(false);
@@ -1914,6 +2278,10 @@ impl TcpConnectionInner {
             }
             self.tx_buffer.consume(consumed);
             self.tx_acked = ack_number;
+        }
+        if self.tx_acked > previous_tx_acked {
+            self.retransmission
+                .on_ack(self.tx_acked, self.tx_send, TimerInstant::now());
         }
 
         // Update the send window.
@@ -2003,7 +2371,6 @@ impl TcpConnectionInner {
             TcpState::CloseWait | TcpState::Closing | TcpState::LastAck => {}
             TcpState::TimeWait => {
                 self.ack(sender);
-                // TODO: restart timer
             }
         }
 
@@ -2019,7 +2386,7 @@ impl TcpConnectionInner {
                 }
                 TcpState::FinWait2 => {
                     self.state = TcpState::TimeWait;
-                    // TODO: start timer
+                    self.restart_time_wait(sender.state.params.tcp_close_timeout);
                 }
                 TcpState::CloseWait
                 | TcpState::Closing

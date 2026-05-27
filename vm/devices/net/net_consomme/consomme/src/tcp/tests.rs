@@ -15,6 +15,7 @@ use futures::AsyncRead;
 use futures::AsyncWrite;
 use pal_async::DefaultDriver;
 use pal_async::socket::PolledSocket;
+use pal_async::timer::Instant;
 use parking_lot::Mutex;
 use smoltcp::wire::DnsQueryType;
 use smoltcp::wire::EthernetAddress;
@@ -27,6 +28,7 @@ use std::net::Ipv6Addr;
 use std::net::SocketAddrV4;
 use std::net::SocketAddrV6;
 use std::sync::Arc;
+use std::time::Duration;
 
 // ── Mock client ────────────────────────────────────────────────────
 
@@ -2167,4 +2169,422 @@ fn tcp_checksum_matches_smoltcp() {
             }
         }
     }
+}
+
+/// Test that connections sitting in a half-closed state are reaped after
+/// the configured `tcp_close_timeout` elapses, preventing leaks. Covers
+/// both `TimeWait` (server-initiated close) and `LastAck` (guest-initiated
+/// close that the guest never finalizes).
+#[pal_async::async_test]
+async fn test_tcp_time_wait_cleanup(driver: DefaultDriver) {
+    let mut h = TcpTestHarness::connect(driver).await;
+
+    // Server initiates close: shutting down the host write side causes
+    // consomme's socket to read EOF, which transitions the connection
+    // from Established → FinWait1 and sends a FIN to the guest.
+    h.clear_guest_packets();
+    h.host_shutdown_write();
+
+    // Wait for the FIN from consomme to the guest and ack it.
+    let fin_pkt = h
+        .poll_until_guest_packet(|t| t.control == TcpControl::Fin)
+        .await;
+    let (_, _, fin_tcp) = parse_tcp_packet(&fin_pkt);
+    // Update server_ack to consume the FIN's sequence byte.
+    h.server_ack = fin_tcp.seq_number + fin_tcp.segment_len();
+
+    // Guest acks the server's FIN (FinWait1 → FinWait2).
+    h.send_segment(TcpControl::None, h.guest_seq, &[]);
+
+    // Guest sends its own FIN (FinWait2 → TimeWait).
+    h.send_fin();
+
+    // Drive the stack once so the FIN is processed.
+    std::future::poll_fn(|cx| {
+        h.consomme.access(&mut h.client).poll(cx);
+        Poll::Ready(())
+    })
+    .await;
+
+    // The connection should now be in TimeWait with a deadline set.
+    {
+        let access = h.consomme.access(&mut h.client);
+        assert_eq!(access.inner.tcp.connections.len(), 1);
+        let conn = access.inner.tcp.connections.values_mut().next().unwrap();
+        assert_eq!(conn.inner.state, TcpState::TimeWait);
+        assert!(
+            conn.inner.close_deadline.is_some(),
+            "close deadline must be armed in TimeWait"
+        );
+        conn.inner.close_deadline = Some(Instant::now() + Duration::from_millis(1));
+    }
+
+    // A retransmitted FIN must be ACKed and restart the 2*MSL timer.
+    h.clear_guest_packets();
+    h.send_segment(TcpControl::Fin, h.guest_seq - 1, &[]);
+    assert!(h.client.received_packets.lock().iter().any(|packet| {
+        TcpTestHarness::is_tcp_packet(packet).is_some_and(|tcp| {
+            tcp.control == TcpControl::None && tcp.ack_number == Some(h.guest_seq)
+        })
+    }));
+
+    {
+        let access = h.consomme.access(&mut h.client);
+        let conn = access.inner.tcp.connections.values_mut().next().unwrap();
+        assert!(
+            conn.inner.close_deadline > Some(Instant::now() + Duration::from_secs(1)),
+            "retransmitted FIN must restart the TimeWait deadline"
+        );
+        // Force the deadline into the past to simulate timeout expiry.
+        conn.inner.close_deadline = Some(Instant::now() - Duration::from_secs(1));
+    }
+
+    // Polling should reap the expired TimeWait connection.
+    std::future::poll_fn(|cx| {
+        h.consomme.access(&mut h.client).poll(cx);
+        Poll::Ready(())
+    })
+    .await;
+
+    assert_eq!(
+        h.consomme.access(&mut h.client).inner.tcp.connections.len(),
+        0,
+        "expired TimeWait connection should be removed"
+    );
+    assert_eq!(
+        h.consomme
+            .access(&mut h.client)
+            .inner
+            .tcp
+            .aggregate_stats
+            .connections_closed_timeout
+            .get(),
+        0,
+        "expired TimeWait connection should not be counted as a timeout close"
+    );
+    assert_eq!(
+        h.consomme
+            .access(&mut h.client)
+            .inner
+            .tcp
+            .aggregate_stats
+            .connections_closed_normal
+            .get(),
+        1,
+        "expired TimeWait connection should be counted as a normal close"
+    );
+}
+
+/// Test that half-closed connections waiting on guest shutdown progress are
+/// counted as timeout closes when their cleanup deadline expires.
+#[pal_async::async_test]
+async fn test_tcp_guest_action_timeout_cleanup(driver: DefaultDriver) {
+    for (state, state_name) in [
+        (TcpState::FinWait1, "FinWait1"),
+        (TcpState::FinWait2, "FinWait2"),
+    ] {
+        let mut h = TcpTestHarness::connect(driver.clone()).await;
+
+        {
+            let access = h.consomme.access(&mut h.client);
+            assert_eq!(access.inner.tcp.connections.len(), 1);
+            let conn = access.inner.tcp.connections.values_mut().next().unwrap();
+            conn.inner.state = state;
+            conn.inner.close_deadline = Some(Instant::now() - Duration::from_secs(1));
+        }
+
+        std::future::poll_fn(|cx| {
+            h.consomme.access(&mut h.client).poll(cx);
+            Poll::Ready(())
+        })
+        .await;
+
+        assert_eq!(
+            h.consomme.access(&mut h.client).inner.tcp.connections.len(),
+            0,
+            "expired {state_name} connection should be removed"
+        );
+        assert_eq!(
+            h.consomme
+                .access(&mut h.client)
+                .inner
+                .tcp
+                .aggregate_stats
+                .connections_closed_timeout
+                .get(),
+            1,
+            "expired {state_name} connection should be counted as a timeout close"
+        );
+        assert_eq!(
+            h.consomme
+                .access(&mut h.client)
+                .inner
+                .tcp
+                .aggregate_stats
+                .connections_closed_normal
+                .get(),
+            0,
+            "expired {state_name} connection should not be counted as a normal close"
+        );
+    }
+}
+
+/// Test that a simultaneous close reaches `Closing`, arms the cleanup
+/// deadline, and is counted as a timeout close if the guest never ACKs our FIN.
+#[pal_async::async_test]
+async fn test_tcp_closing_cleanup(driver: DefaultDriver) {
+    let mut h = TcpTestHarness::connect(driver).await;
+
+    // Server initiates close and consomme sends a FIN to the guest.
+    h.clear_guest_packets();
+    h.host_shutdown_write();
+    let _ = h
+        .poll_until_guest_packet(|t| t.control == TcpControl::Fin)
+        .await;
+
+    // Guest sends its own FIN without ACKing the server FIN, causing the
+    // simultaneous-close FinWait1 -> Closing transition.
+    h.send_fin();
+
+    {
+        let access = h.consomme.access(&mut h.client);
+        assert_eq!(access.inner.tcp.connections.len(), 1);
+        let conn = access.inner.tcp.connections.values_mut().next().unwrap();
+        assert_eq!(conn.inner.state, TcpState::Closing);
+        assert!(
+            conn.inner.close_deadline.is_some(),
+            "close deadline must be armed in Closing"
+        );
+        conn.inner.close_deadline = Some(Instant::now() - Duration::from_secs(1));
+    }
+
+    std::future::poll_fn(|cx| {
+        h.consomme.access(&mut h.client).poll(cx);
+        Poll::Ready(())
+    })
+    .await;
+
+    assert_eq!(
+        h.consomme.access(&mut h.client).inner.tcp.connections.len(),
+        0,
+        "expired Closing connection should be removed"
+    );
+    assert_eq!(
+        h.consomme
+            .access(&mut h.client)
+            .inner
+            .tcp
+            .aggregate_stats
+            .connections_closed_timeout
+            .get(),
+        1,
+        "expired Closing connection should be counted as a timeout close"
+    );
+    assert_eq!(
+        h.consomme
+            .access(&mut h.client)
+            .inner
+            .tcp
+            .aggregate_stats
+            .connections_closed_normal
+            .get(),
+        0,
+        "expired Closing connection should not be counted as a normal close"
+    );
+}
+
+/// Test that a connection stuck in `LastAck` (guest never acks our FIN
+/// after a guest-initiated close) is reaped after the `tcp_close_timeout`
+/// elapses.
+#[pal_async::async_test]
+async fn test_tcp_last_ack_cleanup(driver: DefaultDriver) {
+    let mut h = TcpTestHarness::connect(driver).await;
+
+    // Guest initiates close: send FIN (Established → CloseWait).
+    h.clear_guest_packets();
+    h.send_fin();
+
+    // Drive the stack so consomme processes the FIN, sees host EOF via
+    // the shutdown(Read) implicitly forwarded, and we eventually transition
+    // to LastAck. We need the host stream to also close so consomme calls
+    // close() on its end (CloseWait → LastAck).
+    h.host_shutdown_write();
+
+    // Wait for consomme to send its own FIN to the guest, which means
+    // we have entered LastAck.
+    let _ = h
+        .poll_until_guest_packet(|t| t.control == TcpControl::Fin)
+        .await;
+
+    // Intentionally do NOT ack the FIN. Verify the state and force the
+    // deadline into the past.
+    {
+        let access = h.consomme.access(&mut h.client);
+        assert_eq!(access.inner.tcp.connections.len(), 1);
+        let conn = access.inner.tcp.connections.values_mut().next().unwrap();
+        assert_eq!(conn.inner.state, TcpState::LastAck);
+        assert!(
+            conn.inner.close_deadline.is_some(),
+            "close deadline must be armed in LastAck"
+        );
+        conn.inner.close_deadline = Some(Instant::now() - Duration::from_secs(1));
+    }
+
+    std::future::poll_fn(|cx| {
+        h.consomme.access(&mut h.client).poll(cx);
+        Poll::Ready(())
+    })
+    .await;
+
+    assert_eq!(
+        h.consomme.access(&mut h.client).inner.tcp.connections.len(),
+        0,
+        "expired LastAck connection should be removed"
+    );
+    assert_eq!(
+        h.consomme
+            .access(&mut h.client)
+            .inner
+            .tcp
+            .aggregate_stats
+            .connections_closed_timeout
+            .get(),
+        1,
+        "expired LastAck connection should be counted as a timeout close"
+    );
+    assert_eq!(
+        h.consomme
+            .access(&mut h.client)
+            .inner
+            .tcp
+            .aggregate_stats
+            .connections_closed_normal
+            .get(),
+        0,
+        "expired LastAck connection should not be counted as a normal close"
+    );
+}
+
+#[pal_async::async_test]
+async fn test_tcp_retransmits_unacknowledged_data(driver: DefaultDriver) {
+    let mut h = TcpTestHarness::connect(driver).await;
+    h.clear_guest_packets();
+    h.host_write(b"retransmit me").await;
+
+    let first = h
+        .poll_until_guest_packet(|tcp| !tcp.payload.is_empty())
+        .await;
+    let (_, _, first_tcp) = parse_tcp_packet(&first);
+    let sequence_number = first_tcp.seq_number;
+    let sequence_end = first_tcp.seq_number + first_tcp.segment_len();
+    let payload = first_tcp.payload.to_vec();
+    let initial_rto = h.connection_inner().retransmission.rto;
+
+    h.clear_guest_packets();
+    {
+        let access = h.consomme.access(&mut h.client);
+        let conn = access.inner.tcp.connections.values_mut().next().unwrap();
+        conn.inner.retransmission.deadline = Some(Instant::now() - Duration::from_millis(1));
+    }
+    std::future::poll_fn(|cx| {
+        h.consomme.access(&mut h.client).poll(cx);
+        Poll::Ready(())
+    })
+    .await;
+
+    let packets = h.client.received_packets.lock();
+    let retransmission = packets
+        .iter()
+        .find_map(|packet| TcpTestHarness::is_tcp_packet(packet))
+        .expect("RTO should retransmit the oldest segment");
+    assert_eq!(retransmission.seq_number, sequence_number);
+    assert_eq!(retransmission.payload, payload);
+    drop(packets);
+    assert_eq!(
+        h.connection_inner().retransmission.rto,
+        initial_rto.saturating_mul(2)
+    );
+    assert_eq!(h.connection_inner().stats.retransmission_timeouts.get(), 1);
+    assert_eq!(h.connection_inner().stats.retransmitted_segments.get(), 1);
+
+    h.server_ack = sequence_end;
+    h.send_segment(TcpControl::None, h.guest_seq, &[]);
+    assert!(h.connection_inner().retransmission.deadline.is_none());
+    assert!(h.connection_inner().tx_buffer.is_empty());
+}
+
+#[pal_async::async_test]
+async fn test_tcp_retransmits_fin_until_acknowledged(driver: DefaultDriver) {
+    let mut h = TcpTestHarness::connect(driver).await;
+    h.clear_guest_packets();
+    h.host_shutdown_write();
+
+    let first = h
+        .poll_until_guest_packet(|tcp| tcp.control == TcpControl::Fin)
+        .await;
+    let (_, _, first_fin) = parse_tcp_packet(&first);
+    let fin_sequence = first_fin.seq_number;
+
+    h.clear_guest_packets();
+    {
+        let access = h.consomme.access(&mut h.client);
+        let conn = access.inner.tcp.connections.values_mut().next().unwrap();
+        conn.inner.retransmission.deadline = Some(Instant::now() - Duration::from_millis(1));
+    }
+    std::future::poll_fn(|cx| {
+        h.consomme.access(&mut h.client).poll(cx);
+        Poll::Ready(())
+    })
+    .await;
+
+    let packets = h.client.received_packets.lock();
+    let retransmitted_fin = packets
+        .iter()
+        .find_map(|packet| TcpTestHarness::is_tcp_packet(packet))
+        .expect("RTO should retransmit FIN");
+    assert_eq!(retransmitted_fin.control, TcpControl::Fin);
+    assert_eq!(retransmitted_fin.seq_number, fin_sequence);
+    assert!(retransmitted_fin.payload.is_empty());
+}
+
+#[test]
+fn test_retransmission_state_follows_rfc_6298() {
+    let mut state = RetransmissionState::new();
+    let start = Instant::from_nanos(1_000_000_000);
+
+    state.on_send(TcpSeqNumber(1), start);
+    state.on_ack(
+        TcpSeqNumber(1),
+        TcpSeqNumber(1),
+        start + Duration::from_secs(2),
+    );
+    assert_eq!(state.srtt, Some(Duration::from_secs(2)));
+    assert_eq!(state.rttvar, Some(Duration::from_secs(1)));
+    assert_eq!(state.rto, Duration::from_secs(6));
+    assert!(state.deadline.is_none());
+
+    state.on_send(TcpSeqNumber(2), start + Duration::from_secs(2));
+    state.on_ack(
+        TcpSeqNumber(2),
+        TcpSeqNumber(2),
+        start + Duration::from_secs(3),
+    );
+    assert_eq!(state.srtt, Some(Duration::from_millis(1875)));
+    assert_eq!(state.rttvar, Some(Duration::from_secs(1)));
+    assert_eq!(state.rto, Duration::from_millis(5875));
+
+    state.on_send(TcpSeqNumber(3), start + Duration::from_secs(3));
+    state.on_retransmit(start + Duration::from_secs(9));
+    assert_eq!(state.rto, Duration::from_millis(11750));
+    assert!(
+        state.sample.is_none(),
+        "Karn's algorithm discards the sample"
+    );
+
+    let mut syn_state = RetransmissionState::new();
+    syn_state.on_send(TcpSeqNumber(1), start);
+    syn_state.on_retransmit(start + INITIAL_RTO);
+    syn_state.on_syn_retransmit();
+    syn_state.on_handshake_complete();
+    assert_eq!(syn_state.rto, Duration::from_secs(3));
 }

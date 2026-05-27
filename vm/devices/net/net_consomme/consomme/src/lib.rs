@@ -179,6 +179,12 @@ pub struct ConsommeParams {
     pub client_ip_ipv6_routable: Option<Ipv6Address>,
     /// Idle timeout for UDP connections.
     pub udp_timeout: Duration,
+    /// Timeout for TCP connections sitting in any half-closed state
+    /// (`FinWait1`, `FinWait2`, `Closing`, `LastAck`, or `TimeWait`), after
+    /// which the connection is forcibly cleaned up. Until this deadline,
+    /// unacknowledged data and FINs are retransmitted according to RFC 6298.
+    #[inspect(debug)]
+    pub tcp_close_timeout: Duration,
     /// If true, skip checks for host IPv6 support and assume the host has a
     /// routable IPv6 address.
     pub skip_ipv6_checks: bool,
@@ -248,6 +254,8 @@ impl ConsommeParams {
             client_ip_ipv6_routable: None,
             // Per RFC 4787, UDP NAT bindings, by default, should timeout after 5 minutes, but can be configured.
             udp_timeout: Duration::from_secs(300),
+            // Defaults to 2*MSL per RFC 9293 for the `TimeWait` case.
+            tcp_close_timeout: Duration::from_secs(60),
             skip_ipv6_checks: false,
             allow_host_local_access: false,
             tcp_rx_buffer: DEFAULT_TCP_BUFFER_BOUNDS,
@@ -826,9 +834,9 @@ impl Consomme {
                     )
                 }
             };
-        let timeout = params.udp_timeout;
         let tcp_rx_buffer = params.tcp_rx_buffer;
         let tcp_tx_buffer = params.tcp_tx_buffer;
+        let udp_timeout = params.udp_timeout;
         Self {
             state: ConsommeState {
                 params,
@@ -836,7 +844,7 @@ impl Consomme {
                 local_addr_map: local_addr_map::LocalAddrMap::new(),
             },
             tcp: tcp::Tcp::new(tcp_rx_buffer, tcp_tx_buffer),
-            udp: udp::Udp::new(timeout),
+            udp: udp::Udp::new(udp_timeout),
             icmp: icmp::Icmp::new(),
             dns,
             host_has_ipv6,
