@@ -83,7 +83,7 @@ impl<T: Client> Access<'_, T> {
     ) -> Result<(), DropReason> {
         let icmpv6_packet = Icmpv6Packet::new_unchecked(payload);
         let ndp = NdiscRepr::parse(&icmpv6_packet)?;
-
+        tracing::info!(?ndp, "received NDP message");
         match ndp {
             NdiscRepr::RouterSolicit { lladdr } => {
                 self.handle_router_solicit(frame, ipv6_src_addr, lladdr)
