@@ -280,7 +280,7 @@ impl<T: Client> Access<'_, T> {
         // We learn the client's address here because consomme is the only other
         // entity on this virtual link, so DAD will always succeed.
         if ipv6_src_addr.is_unspecified() {
-            tracing::debug!(%target_addr, "learned client IPv6 address from DAD Neighbor Solicitation");
+            tracing::info!(%target_addr, "learned client IPv6 address from DAD Neighbor Solicitation");
             if target_addr.is_unicast_link_local() {
                 self.inner.state.params.client_ip_ipv6 = Some(target_addr);
             } else {
@@ -312,7 +312,7 @@ impl<T: Client> Access<'_, T> {
             target_addr,
             self.inner.state.params.prefix_len_ipv6,
         ) {
-            tracing::debug!(
+            tracing::info!(
                 target_addr = %target_addr,
                 gateway = %self.inner.state.params.gateway_link_local_ipv6,
                 prefix_len = %self.inner.state.params.prefix_len_ipv6,
@@ -334,7 +334,7 @@ impl<T: Client> Access<'_, T> {
         let client_ip_known =
             params.client_ip_ipv6.is_some() || params.client_ip_ipv6_routable.is_some();
         if target_is_client || (!client_ip_known && params.gateway_link_local_ipv6 != target_addr) {
-            tracing::debug!(
+            tracing::info!(
                 target_addr = %target_addr,
                 client_ip = ?params.client_ip_ipv6,
                 client_ip_routable = ?params.client_ip_ipv6_routable,
