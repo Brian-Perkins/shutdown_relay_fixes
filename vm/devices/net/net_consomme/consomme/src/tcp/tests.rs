@@ -724,6 +724,84 @@ async fn test_tcp_port_forward_loopback_src_rewritten(driver: DefaultDriver) {
     );
 }
 
+/// Test that a guest connection to its own forwarded TCP port loops back
+/// through the host listener.
+#[pal_async::async_test]
+async fn test_tcp_guest_loopback_to_bound_port(driver: DefaultDriver) {
+    let mut consomme = Consomme::new(ConsommeParams::new().unwrap());
+    let mut client = TestClient::new(driver.clone());
+
+    let guest_port = 9998;
+    let guest_client_port = 45678;
+    let guest_isn = TcpSeqNumber(3000);
+    let received = client.received_packets.clone();
+
+    let guest_mac = consomme.params_mut().client_mac;
+    let gateway_mac = consomme.params_mut().gateway_mac;
+    let guest_ip = consomme.params_mut().client_ip;
+
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    socket
+        .bind(&SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+        .unwrap();
+
+    {
+        let mut access = consomme.access(&mut client);
+        access
+            .bind_tcp_port(socket, guest_port)
+            .expect("bind should succeed");
+    }
+
+    let syn = TcpRepr {
+        src_port: guest_client_port,
+        dst_port: guest_port,
+        control: TcpControl::Syn,
+        seq_number: guest_isn,
+        ack_number: None,
+        window_len: 64240,
+        window_scale: Some(7),
+        max_seg_size: Some(1460),
+        sack_permitted: false,
+        sack_ranges: [None, None, None],
+        timestamp: None,
+        payload: &[],
+    };
+    let mut buf = vec![0u8; 1514];
+    let len = build_tcp_packet(&mut buf, guest_mac, gateway_mac, guest_ip, guest_ip, &syn);
+    consomme
+        .access(&mut client)
+        .send(&buf[..len], &ChecksumState::NONE)
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        std::future::poll_fn(|cx| {
+            consomme.access(&mut client).poll(cx);
+            Poll::Ready(())
+        })
+        .await;
+
+        let has_syn_ack = received.lock().iter().any(|p| {
+            TcpTestHarness::is_tcp_packet(p).is_some_and(|t| {
+                t.control == TcpControl::Syn
+                    && t.ack_number == Some(guest_isn + 1)
+                    && t.src_port == guest_port
+                    && t.dst_port == guest_client_port
+            })
+        });
+        if has_syn_ack {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for guest loopback SYN-ACK"
+        );
+        pal_async::timer::PolledTimer::new(&driver)
+            .sleep(std::time::Duration::from_millis(10))
+            .await;
+    }
+}
+
 /// Test that binding the same guest port twice returns `PortAlreadyBound`.
 #[pal_async::async_test]
 async fn test_tcp_bind_duplicate_port(driver: DefaultDriver) {

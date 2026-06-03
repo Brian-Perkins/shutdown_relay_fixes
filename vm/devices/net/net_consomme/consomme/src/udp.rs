@@ -442,7 +442,7 @@ impl<T: Client> Access<'_, T> {
             // translate it so that the connection loops back to the expected destination.
             let key = PortForwardKey::from_socket_addr(dst_sock_addr, dst_sock_addr.port());
             if let Some(listener) = self.inner.udp.listeners.get(&key) {
-                dst_sock_addr.set_port(listener.host_addr.port());
+                dst_sock_addr = listener.host_addr;
             }
         }
 
