@@ -272,8 +272,7 @@ fn inspect_seq(seq: &TcpSeqNumber) -> inspect::AsHex<u32> {
 struct TcpListener {
     #[inspect(skip)]
     socket: PolledSocket<Socket>,
-    #[inspect(display)]
-    host_addr: SocketAddr,
+    host_port: u16,
 }
 
 #[derive(Debug, PartialEq, Eq, Inspect)]
@@ -551,7 +550,7 @@ impl<T: Client> Access<'_, T> {
                         {
                             FourTuple {
                                 src: sender.ft.src,
-                                dst: listener.host_addr,
+                                dst: SocketAddr::new(resolved_dst.ip(), listener.host_port),
                             }
                         } else if resolved_dst != sender.ft.dst {
                             FourTuple {
@@ -1652,7 +1651,12 @@ impl TcpListener {
     /// The socket must already be bound to an address. This method will call
     /// `listen` on it.
     pub fn from_socket(driver: &dyn Driver, socket: Socket) -> Result<Self, BindError> {
-        let Some(host_addr) = socket.local_addr().map_err(BindError::Io)?.as_socket() else {
+        let Some(host_port) = socket
+            .local_addr()
+            .map_err(BindError::Io)?
+            .as_socket()
+            .map(|addr| addr.port())
+        else {
             return Err(BindError::Io(io::Error::other(
                 "socket local address is invalid",
             )));
@@ -1665,7 +1669,7 @@ impl TcpListener {
             );
             return Err(BindError::Io(err));
         }
-        Ok(Self { socket, host_addr })
+        Ok(Self { socket, host_port })
     }
 
     fn poll_listener(
