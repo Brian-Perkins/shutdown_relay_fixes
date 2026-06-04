@@ -39,6 +39,7 @@ use pal_async::driver::Driver;
 use smoltcp::phy::Checksum;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::DhcpMessageType;
+use smoltcp::wire::ETHERNET_HEADER_LEN;
 use smoltcp::wire::EthernetAddress;
 use smoltcp::wire::EthernetFrame;
 use smoltcp::wire::EthernetProtocol;
@@ -171,6 +172,11 @@ pub struct ConsommeParams {
     /// routable IPv6 address.
     #[inspect(display)]
     pub skip_ipv6_checks: bool,
+    /// If true, allow guest traffic destined for host-local addresses
+    /// (loopback or unspecified). Otherwise, traffic to these addresses is
+    /// routed directly back to the guest.
+    #[inspect(display)]
+    pub allow_host_local_access: bool,
 }
 
 /// An error indicating that the CIDR is invalid.
@@ -204,6 +210,7 @@ impl ConsommeParams {
             // Per RFC 4787, UDP NAT bindings, by default, should timeout after 5 minutes, but can be configured.
             udp_timeout: Duration::from_secs(300),
             skip_ipv6_checks: false,
+            allow_host_local_access: false,
         })
     }
 
@@ -632,6 +639,23 @@ impl IpAddresses {
     }
 }
 
+/// Returns `true` if the given IPv4 destination is host-local
+/// (loopback or unspecified) and should be routed back to the guest
+/// when `allow_host_local_access` is disabled.
+fn should_loopback_host_local_ipv4(addr: Ipv4Address) -> bool {
+    addr.is_loopback() || addr.is_unspecified()
+}
+
+/// Returns `true` if the given IPv6 destination is host-local
+/// (loopback or unspecified) and should be routed back to the guest
+/// when `allow_host_local_access` is disabled.
+fn should_loopback_host_local_ipv6(addr: Ipv6Address) -> bool {
+    // Do not blanket-loopback link-local addresses here. An arbitrary fe80::/10
+    // address can be guest-local traffic, and determining whether it belongs to
+    // the host requires host interface address and scope information.
+    addr.is_loopback() || addr.is_unspecified()
+}
+
 /// Returns `true` if two IPv4 addresses are in the same subnet given a mask.
 pub(crate) fn is_same_ipv4_subnet(
     addr1: Ipv4Address,
@@ -848,6 +872,14 @@ impl<T: Client> Access<'_, T> {
             return Err(DropReason::Ipv4Checksum);
         }
 
+        // Keep host-local traffic out of the host stack by routing it back to
+        // the guest as an incoming packet.
+        if !self.inner.state.params.allow_host_local_access
+            && should_loopback_host_local_ipv4(ipv4.dst_addr())
+        {
+            return self.loopback_ipv4(frame, &payload[..total_len], checksum);
+        }
+
         let addresses = Ipv4Addresses {
             src_addr: ipv4.src_addr(),
             dst_addr: ipv4.dst_addr(),
@@ -888,6 +920,19 @@ impl<T: Client> Access<'_, T> {
             if payload.len() < required_len {
                 return Err(DropReason::MalformedPacket);
             }
+        }
+
+        // Keep host-local traffic out of the host stack by routing it back to
+        // the guest as an incoming packet.
+        if !self.inner.state.params.allow_host_local_access
+            && should_loopback_host_local_ipv6(ipv6.dst_addr())
+        {
+            let total_len = if segmentation_offload {
+                payload.len()
+            } else {
+                smoltcp::wire::IPV6_HEADER_LEN + ipv6.payload_len() as usize
+            };
+            return self.loopback_ipv6(frame, &payload[..total_len], checksum);
         }
 
         let next_header = ipv6.next_header();
@@ -939,6 +984,72 @@ impl<T: Client> Access<'_, T> {
         Ok(())
     }
 
+    fn loopback_ipv4(
+        &mut self,
+        frame: &EthernetRepr,
+        payload: &[u8],
+        checksum: &ChecksumState,
+    ) -> Result<(), DropReason> {
+        self.loopback_ip(
+            frame.src_addr,
+            EthernetProtocol::Ipv4,
+            self.inner.state.params.gateway_mac,
+            payload,
+            ChecksumState {
+                ipv4: true,
+                tcp: checksum.tcp,
+                udp: checksum.udp,
+                tso: None,
+                gso: None,
+            },
+        )
+    }
+
+    fn loopback_ipv6(
+        &mut self,
+        frame: &EthernetRepr,
+        payload: &[u8],
+        checksum: &ChecksumState,
+    ) -> Result<(), DropReason> {
+        self.loopback_ip(
+            frame.src_addr,
+            EthernetProtocol::Ipv6,
+            self.inner.state.params.gateway_mac_ipv6,
+            payload,
+            ChecksumState {
+                ipv4: false,
+                tcp: checksum.tcp,
+                udp: checksum.udp,
+                tso: None,
+                gso: None,
+            },
+        )
+    }
+
+    fn loopback_ip(
+        &mut self,
+        dst_mac: EthernetAddress,
+        ethertype: EthernetProtocol,
+        src_mac: EthernetAddress,
+        payload: &[u8],
+        checksum: ChecksumState,
+    ) -> Result<(), DropReason> {
+        let frame_len = ETHERNET_HEADER_LEN + payload.len();
+        if frame_len > self.inner.state.buffer.len() {
+            return Err(DropReason::SendBufferFull);
+        }
+
+        let buffer = &mut self.inner.state.buffer[..frame_len];
+        let mut eth = EthernetFrame::new_unchecked(&mut *buffer);
+        eth.set_src_addr(src_mac);
+        eth.set_dst_addr(dst_mac);
+        eth.set_ethertype(ethertype);
+        eth.payload_mut().copy_from_slice(payload);
+
+        self.client.recv(buffer, &checksum);
+        Ok(())
+    }
+
     /// Updates the DNS nameservers based on the current consomme parameters.
     pub fn update_dns_nameservers(&mut self) {
         if self.inner.dns.is_some() {
@@ -952,44 +1063,4 @@ impl<T: Client> Access<'_, T> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use smoltcp::wire::Ipv6Address;
-
-    #[test]
-    fn test_is_same_ipv6_subnet_basic() {
-        let a = Ipv6Address::new(0x2001, 0x0db8, 0x0001, 0, 0, 0, 0, 1);
-        let b = Ipv6Address::new(0x2001, 0x0db8, 0x0001, 0, 0, 0, 0, 2);
-        assert!(is_same_ipv6_subnet(a, b, 48));
-        assert!(!is_same_ipv6_subnet(a, b, 128));
-    }
-
-    #[test]
-    fn test_is_same_ipv6_subnet_prefix_zero() {
-        let a = Ipv6Address::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1);
-        let b = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
-        assert!(is_same_ipv6_subnet(a, b, 0));
-    }
-
-    #[test]
-    fn test_is_same_ipv6_subnet_prefix_128_exact_match() {
-        let a = Ipv6Address::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1);
-        assert!(is_same_ipv6_subnet(a, a, 128));
-    }
-
-    #[test]
-    fn test_is_same_ipv6_subnet_prefix_128_no_match() {
-        let a = Ipv6Address::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1);
-        let b = Ipv6Address::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 2);
-        assert!(!is_same_ipv6_subnet(a, b, 128));
-    }
-
-    #[test]
-    fn test_is_same_ipv6_subnet_prefix_above_128_does_not_panic() {
-        let a = Ipv6Address::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1);
-        let b = Ipv6Address::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 2);
-        // prefix_len > 128 should behave like /128 (exact match), not panic.
-        assert!(is_same_ipv6_subnet(a, a, 200));
-        assert!(!is_same_ipv6_subnet(a, b, 255));
-    }
-}
+mod tests;
