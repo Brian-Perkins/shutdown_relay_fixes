@@ -144,6 +144,40 @@ fn build_ipv6_syn(
     ETHERNET_HEADER_LEN + smoltcp::wire::IPV6_HEADER_LEN + tcp.header_len()
 }
 
+#[test]
+fn ipv6_hop_by_hop_skips_to_upper_layer_payload() {
+    let tcp_payload = [0xaa, 0xbb, 0xcc, 0xdd];
+    let mut payload = [0u8; 12];
+    payload[0] = IpProtocol::Tcp.into();
+    payload[1] = 0;
+    payload[2] = 1;
+    payload[3] = 4;
+    payload[8..].copy_from_slice(&tcp_payload);
+
+    let upper_layer = ipv6_upper_layer_payload(IpProtocol::HopByHop, &payload).unwrap();
+
+    assert_eq!(upper_layer.next_header, IpProtocol::Tcp);
+    assert_eq!(upper_layer.payload, tcp_payload);
+}
+
+#[test]
+fn ipv6_extension_header_length_is_validated() {
+    let payload = [IpProtocol::Tcp.into(), 1, 0, 0, 0, 0, 0, 0];
+
+    assert!(matches!(
+        ipv6_upper_layer_payload(IpProtocol::HopByHop, &payload),
+        Err(DropReason::Packet(_))
+    ));
+}
+
+#[test]
+fn ipv6_fragment_header_is_dropped() {
+    assert!(matches!(
+        ipv6_upper_layer_payload(IpProtocol::Ipv6Frag, &[0; 8]),
+        Err(DropReason::FragmentedPacket)
+    ));
+}
+
 fn assert_ipv4_not_looped_back(
     client: &TestClient,
     expected_src_ip: Ipv4Address,
