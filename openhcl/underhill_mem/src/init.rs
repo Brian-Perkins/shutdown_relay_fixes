@@ -24,6 +24,8 @@ use memory_range::AlignedSubranges;
 use memory_range::MemoryRange;
 use pal_async::task::Spawn;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use tracing::Instrument;
 use underhill_threadpool::AffinitizedThreadpool;
 use virt::IsolationType;
@@ -103,6 +105,56 @@ pub struct BootInit<'a> {
     pub accepted_regions: &'a [MemoryRange],
 }
 
+fn run_memory_range_operations_in_parallel(
+    ranges: impl IntoIterator<Item = MemoryRange>,
+    worker_count: u32,
+    operation: impl Fn(MemoryRange) -> anyhow::Result<()> + Sync,
+) -> anyhow::Result<()> {
+    const LARGE_PAGE_SIZE: u64 = 2 * 1024 * 1024;
+    const MAX_RANGE_LEN: u64 = 2 << 30;
+
+    assert_ne!(worker_count, 0);
+    let ranges: Vec<_> = ranges.into_iter().collect();
+    let total_len = ranges
+        .iter()
+        .fold(0_u64, |len, range| len.saturating_add(range.len()));
+    let target_range_len = total_len
+        .div_ceil(u64::from(worker_count))
+        .clamp(LARGE_PAGE_SIZE, MAX_RANGE_LEN)
+        .next_multiple_of(LARGE_PAGE_SIZE)
+        .min(MAX_RANGE_LEN);
+
+    // Preserve large-page alignment while creating enough work to keep all
+    // workers busy, with a ceiling to balance very large memory ranges.
+    let ranges: Vec<_> = ranges
+        .into_iter()
+        .flat_map(|range| AlignedSubranges::new(range).with_max_range_len(target_range_len))
+        .collect();
+    let worker_count = usize::min(worker_count as usize, ranges.len());
+    let next_range = AtomicUsize::new(0);
+
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..worker_count)
+            .map(|_| {
+                scope.spawn(|| {
+                    loop {
+                        let index = next_range.fetch_add(1, Ordering::Relaxed);
+                        let Some(&range) = ranges.get(index) else {
+                            return Ok::<(), anyhow::Error>(());
+                        };
+                        operation(range)?;
+                    }
+                })
+            })
+            .collect();
+
+        for worker in workers {
+            worker.join().expect("memory range worker panicked")?;
+        }
+        Ok(())
+    })
+}
+
 pub async fn init(params: &Init<'_>) -> anyhow::Result<MemoryMappings> {
     let mut validated_ranges = Vec::new();
 
@@ -129,66 +181,53 @@ pub async fn init(params: &Init<'_>) -> anyhow::Result<MemoryMappings> {
         } else {
             // Prepare VTL0 memory for mapping.
             let acceptor = acceptor.as_ref().unwrap();
-            let ram = params.mem_layout.ram().iter().map(|r| r.range);
-            let accepted_ranges = boot_init.accepted_regions.iter().copied();
+            let ram: Vec<_> = params.mem_layout.ram().iter().map(|r| r.range).collect();
+            let accepted_ranges = boot_init.accepted_regions;
+            let worker_count = std::cmp::max(1, params.processor_topology.vp_count() - 1);
             // On hardware isolated platforms, accepted memory was accepted with
             // VTL2 only permissions. Provide VTL0 access here.
             tracing::debug!("Applying VTL0 protections");
             if hardware_isolated {
-                for range in memory_range::overlapping_ranges(ram.clone(), accepted_ranges.clone())
-                {
-                    acceptor.apply_initial_lower_vtl_protections(range)?;
-                }
+                run_memory_range_operations_in_parallel(
+                    memory_range::overlapping_ranges(
+                        ram.iter().copied(),
+                        accepted_ranges.iter().copied(),
+                    ),
+                    worker_count,
+                    |range| {
+                        acceptor
+                            .apply_initial_lower_vtl_protections(range)
+                            .with_context(|| {
+                                format!("failed to apply initial protections to {range}")
+                            })
+                    },
+                )?;
             }
 
             // Accept the memory that was not accepted by the boot loader.
             // FUTURE: do this lazily.
-            let vp_count = std::cmp::max(1, params.processor_topology.vp_count() - 1);
-            let accept_subrange = move |subrange| {
-                acceptor.accept_lower_vtl_pages(subrange).unwrap();
-                if hardware_isolated {
-                    // For VBS-isolated VMs, the VTL protections are set as
-                    // part of the accept call.
-                    acceptor
-                        .apply_initial_lower_vtl_protections(subrange)
-                        .unwrap();
-                }
-            };
             tracing::debug!("Accepting VTL0 memory");
-            std::thread::scope(|scope| {
-                for source_range in memory_range::subtract_ranges(ram, accepted_ranges) {
-                    validated_ranges.push(source_range);
-
-                    // Chunks must be 2mb aligned
-                    let two_mb = 2 * 1024 * 1024;
-                    let mut range = source_range.aligned_subrange(two_mb);
-                    if !range.is_empty() {
-                        let chunk_size = (range.page_count_2m().div_ceil(vp_count as u64)) * two_mb;
-                        let chunk_count = range.len().div_ceil(chunk_size);
-
-                        for _ in 0..chunk_count {
-                            let subrange;
-                            (subrange, range) = if range.len() >= chunk_size {
-                                range.split_at_offset(chunk_size)
-                            } else {
-                                (range, MemoryRange::EMPTY)
-                            };
-                            scope.spawn(move || accept_subrange(subrange));
-                        }
-                        assert!(range.is_empty());
+            validated_ranges.extend(memory_range::subtract_ranges(
+                ram.iter().copied(),
+                accepted_ranges.iter().copied(),
+            ));
+            run_memory_range_operations_in_parallel(
+                validated_ranges.iter().copied(),
+                worker_count,
+                |range| {
+                    acceptor
+                        .accept_lower_vtl_pages(range)
+                        .with_context(|| format!("failed to accept lower VTL pages in {range}"))?;
+                    if hardware_isolated {
+                        acceptor
+                            .apply_initial_lower_vtl_protections(range)
+                            .with_context(|| {
+                                format!("failed to apply initial protections to {range}")
+                            })?;
                     }
-
-                    // Now accept whatever wasn't aligned on the edges
-                    scope.spawn(move || {
-                        for unaligned_subrange in memory_range::subtract_ranges(
-                            [source_range],
-                            [source_range.aligned_subrange(two_mb)],
-                        ) {
-                            accept_subrange(unaligned_subrange);
-                        }
-                    });
-                }
-            });
+                    Ok(())
+                },
+            )?;
         }
     }
 
@@ -432,11 +471,12 @@ pub async fn init(params: &Init<'_>) -> anyhow::Result<MemoryMappings> {
                 tracing::info_span!("zeroing lower vtl memory for SNP", CVM_ALLOWED).entered();
 
             tracing::debug!("zeroing lower vtl memory for SNP");
-            for range in validated_ranges {
+            let worker_count = std::cmp::max(1, params.processor_topology.vp_count() - 1);
+            run_memory_range_operations_in_parallel(validated_ranges, worker_count, |range| {
                 vtl0_gm
                     .fill_at(range.start(), 0, range.len() as usize)
-                    .expect("private memory should be valid at this stage");
-            }
+                    .context("private memory should be valid at this stage")
+            })?;
         }
 
         // Untrusted devices can only access shared memory, but they can do so
