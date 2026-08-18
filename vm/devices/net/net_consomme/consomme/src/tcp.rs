@@ -87,7 +87,7 @@ struct TcpAggregateStats {
     connections_closed_peer_rst: Counter,
     /// Connections closed due to local errors (socket failures, invalid handshake).
     connections_closed_local_error: Counter,
-    /// Connections reaped after the peer did not finish the shutdown handshake.
+    /// Connections reaped after the peer did not finish a handshake.
     connections_closed_timeout: Counter,
 }
 
@@ -250,6 +250,9 @@ struct TcpConnectionInner {
     loopback_port: LoopbackPortInfo,
     state: TcpState,
 
+    /// Deadline at which an incomplete TCP handshake should be abandoned.
+    #[inspect(with = "|x| x.is_some()")]
+    handshake_deadline: Option<TimerInstant>,
     /// Deadline at which a connection in a half-closed state (`FinWait1`,
     /// `FinWait2`, `Closing`, `LastAck`, or `TimeWait`) should be forcibly
     /// reclaimed.
@@ -315,6 +318,7 @@ const INITIAL_RTO: Duration = Duration::from_secs(1);
 const MIN_RTO: Duration = Duration::from_secs(1);
 const MAX_RTO: Duration = Duration::from_secs(60);
 const CLOCK_GRANULARITY: Duration = Duration::from_millis(1);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Inspect)]
 struct RetransmissionState {
@@ -378,6 +382,13 @@ impl RetransmissionState {
         // cannot be used as an RTT sample.
         self.sample = None;
         self.rto = self.rto.saturating_mul(2).min(MAX_RTO);
+        self.deadline = Some(now + self.rto);
+    }
+
+    fn on_early_retransmit(&mut self, now: TimerInstant) {
+        // Karn's algorithm still applies, but RFC 6298 only backs off the RTO
+        // after its timer expires.
+        self.sample = None;
         self.deadline = Some(now + self.rto);
     }
 
@@ -647,7 +658,7 @@ impl<T: Client> Access<'_, T> {
                     src = %ft.src,
                     dst = %ft.dst,
                     state = ?conn.inner.state,
-                    "TCP close timer expired, reclaiming connection",
+                    "TCP connection timer expired, reclaiming connection",
                 );
                 match conn.inner.state {
                     TcpState::TimeWait => self
@@ -1073,6 +1084,7 @@ impl TcpConnection {
         TcpConnectionInner {
             loopback_port: LoopbackPortInfo::None,
             state: TcpState::Connecting,
+            handshake_deadline: None,
             close_deadline: None,
             timer: None,
             retransmission: RetransmissionState::new(),
@@ -1188,6 +1200,7 @@ impl TcpConnection {
             ..Self::new_base(params)
         };
         inner.timer = Some(TcpTimer::new(sender.client.driver()));
+        inner.start_handshake_deadline();
         inner.send_syn(sender, None);
         Ok(Self {
             backend: TcpBackend::Socket {
@@ -1222,6 +1235,7 @@ impl TcpConnection {
 
         // Immediately transition to SynReceived so the handshake SYN-ACK is sent.
         inner.state = TcpState::SynReceived;
+        inner.start_handshake_deadline();
         inner.send_syn(sender, Some(inner.rx_seq));
 
         Ok(Self {
@@ -1367,11 +1381,13 @@ impl TcpConnectionInner {
                         "connection established",
                     );
                     self.state = TcpState::SynReceived;
+                    self.start_handshake_deadline();
                 }
                 Poll::Pending => return true,
             }
         } else if self.state == TcpState::SynSent {
             // Need to establish connection with client before sending data.
+            self.send_next(sender, AckPolicy::Flush);
             return true;
         }
 
@@ -1728,6 +1744,7 @@ impl TcpConnectionInner {
     fn send_next(&mut self, sender: &mut Sender<'_, impl Client>, ack_policy: AckPolicy) {
         match self.state {
             TcpState::Connecting => {}
+            TcpState::SynSent => self.send_syn(sender, None),
             TcpState::SynReceived => self.send_syn(sender, Some(self.rx_seq)),
             _ => self.send_data(sender, ack_policy),
         }
@@ -1910,6 +1927,7 @@ impl TcpConnectionInner {
 
     fn close(&mut self, close_timeout: Duration) {
         tracing::trace!("fin");
+        self.handshake_deadline = None;
         match self.state {
             TcpState::SynSent | TcpState::SynReceived | TcpState::Established => {
                 self.state = TcpState::FinWait1;
@@ -1929,6 +1947,10 @@ impl TcpConnectionInner {
         self.tx_fin_buffered = true;
     }
 
+    fn start_handshake_deadline(&mut self) {
+        self.handshake_deadline = Some(TimerInstant::now() + HANDSHAKE_TIMEOUT);
+    }
+
     /// Start the user timeout for a graceful close. State transitions do not
     /// extend it; outstanding data and FINs are retransmitted until it expires.
     fn start_close_deadline(&mut self, close_timeout: Duration) {
@@ -1942,14 +1964,17 @@ impl TcpConnectionInner {
         self.close_deadline = Some(TimerInstant::now() + close_timeout);
     }
 
-    /// Poll the retransmission and close timers. Returns `true` when the
-    /// connection's close timeout has expired.
+    /// Poll the retransmission and connection-lifetime timers. Returns `true`
+    /// when the connection should be reclaimed.
     fn poll_timers(&mut self, cx: &mut Context<'_>, sender: &mut Sender<'_, impl Client>) -> bool {
-        let Some(deadline) = [self.close_deadline, self.retransmission.deadline]
-            .into_iter()
-            .flatten()
-            .min()
-        else {
+        let Some(deadline) = [
+            self.handshake_deadline,
+            self.close_deadline,
+            self.retransmission.deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .min() else {
             return false;
         };
 
@@ -1962,7 +1987,11 @@ impl TcpConnectionInner {
             return false;
         };
 
-        if self.close_deadline.is_some_and(|deadline| now >= deadline) {
+        if self
+            .handshake_deadline
+            .is_some_and(|deadline| now >= deadline)
+            || self.close_deadline.is_some_and(|deadline| now >= deadline)
+        {
             return true;
         }
 
@@ -1979,10 +2008,14 @@ impl TcpConnectionInner {
             }
         }
 
-        if let Some(deadline) = [self.close_deadline, self.retransmission.deadline]
-            .into_iter()
-            .flatten()
-            .min()
+        if let Some(deadline) = [
+            self.handshake_deadline,
+            self.close_deadline,
+            self.retransmission.deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
         {
             let _ = self
                 .timer
@@ -1995,16 +2028,16 @@ impl TcpConnectionInner {
 
     /// Retransmit the earliest unacknowledged segment per RFC 6298 section 5.4.
     fn retransmit_earliest(&mut self, sender: &mut Sender<'_, impl Client>) -> bool {
-        if self.tx_acked >= self.tx_send || sender.client.rx_mtu() == 0 {
-            return false;
+        if matches!(self.state, TcpState::SynSent | TcpState::SynReceived) {
+            let retransmitted = self.retransmit_syn(sender);
+            if retransmitted {
+                self.retransmission.on_syn_retransmit();
+            }
+            return retransmitted;
         }
 
-        if matches!(self.state, TcpState::SynSent | TcpState::SynReceived) {
-            let ack_number = (self.state == TcpState::SynReceived).then_some(self.rx_seq);
-            self.emit_syn(sender, self.tx_acked, ack_number);
-            self.retransmission.on_syn_retransmit();
-            self.stats.retransmitted_segments.increment();
-            return true;
+        if self.tx_acked >= self.tx_send || sender.client.rx_mtu() == 0 {
+            return false;
         }
 
         let window_len = self.rx_window_len();
@@ -2055,6 +2088,17 @@ impl TcpConnectionInner {
         self.stats.retransmitted_segments.increment();
         self.stats.retransmitted_bytes.add(payload_len as u64);
         self.record_advertised_window(window_len);
+        true
+    }
+
+    fn retransmit_syn(&mut self, sender: &mut Sender<'_, impl Client>) -> bool {
+        if self.tx_acked >= self.tx_send || sender.client.rx_mtu() == 0 {
+            return false;
+        }
+
+        let ack_number = (self.state == TcpState::SynReceived).then_some(self.rx_seq);
+        self.emit_syn(sender, self.tx_acked, ack_number);
+        self.stats.retransmitted_segments.increment();
         true
     }
 
@@ -2123,17 +2167,53 @@ impl TcpConnectionInner {
         sender: &mut Sender<'_, impl Client>,
         tcp: &TcpRepr<'_>,
     ) -> Result<bool, DropReason> {
-        if tcp.control != TcpControl::Syn || tcp.segment_len() != 1 {
-            tracing::error!(?tcp.control, "invalid packet waiting for syn, drop connection");
-            return Ok(false);
+        let ack_acceptable = tcp
+            .ack_number
+            .is_some_and(|ack| ack > self.tx_acked && ack <= self.tx_send);
+
+        if let Some(ack_number) = tcp.ack_number
+            && !ack_acceptable
+        {
+            if tcp.control != TcpControl::Rst {
+                tracing::debug!(
+                    src = %sender.ft.src,
+                    dst = %sender.ft.dst,
+                    "stale ACK while waiting for SYN, retrying connection"
+                );
+                sender.rst(ack_number, None);
+                self.stats.rsts_tx.increment();
+
+                let now = TimerInstant::now();
+                if self.retransmit_syn(sender) {
+                    self.retransmission.on_early_retransmit(now);
+                }
+            }
+            return Ok(true);
         }
 
-        let ack_number = tcp.ack_number.ok_or(TcpError::MissingAck)?;
-        if ack_number <= self.tx_acked || ack_number > self.tx_send {
-            sender.rst(ack_number, None);
-            self.stats.rsts_tx.increment();
-            return Ok(false);
+        if tcp.control == TcpControl::Rst {
+            if ack_acceptable {
+                tracing::debug!(
+                    src = %sender.ft.src,
+                    dst = %sender.ft.dst,
+                    "connection reset while waiting for SYN"
+                );
+                self.last_close_reason = ConnectionCloseReason::PeerRst;
+                return Ok(false);
+            }
+            return Ok(true);
         }
+
+        if tcp.control != TcpControl::Syn || tcp.segment_len() != 1 {
+            tracing::debug!(
+                ?tcp.control,
+                src = %sender.ft.src,
+                dst = %sender.ft.dst,
+                "ignoring packet while waiting for SYN"
+            );
+            return Ok(true);
+        }
+        let ack_number = tcp.ack_number.ok_or(TcpError::MissingAck)?;
         self.tx_acked = ack_number;
         self.retransmission
             .on_ack(ack_number, self.tx_send, TimerInstant::now());
@@ -2146,6 +2226,7 @@ impl TcpConnectionInner {
         // Send an ACK to complete the initial SYN handshake.
         self.ack(sender);
 
+        self.handshake_deadline = None;
         self.state = TcpState::Established;
         Ok(true)
     }
@@ -2245,6 +2326,7 @@ impl TcpConnectionInner {
             self.tx_window_rx_seq = tcp.seq_number;
             self.tx_window_tx_seq = ack_number;
             self.tx_acked += 1;
+            self.handshake_deadline = None;
             self.state = TcpState::Established;
             self.retransmission.on_handshake_complete();
         }

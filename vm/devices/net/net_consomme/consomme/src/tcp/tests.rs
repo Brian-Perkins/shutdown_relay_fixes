@@ -35,6 +35,7 @@ use std::time::Duration;
 struct TestClient {
     driver: DefaultDriver,
     received_packets: Arc<Mutex<Vec<Vec<u8>>>>,
+    rx_buffers: Option<usize>,
 }
 
 #[test]
@@ -257,7 +258,20 @@ impl TestClient {
         Self {
             driver,
             received_packets: Arc::new(Mutex::new(Vec::new())),
+            rx_buffers: None,
         }
+    }
+
+    fn with_rx_buffers(driver: DefaultDriver, rx_buffers: usize) -> Self {
+        Self {
+            driver,
+            received_packets: Arc::new(Mutex::new(Vec::new())),
+            rx_buffers: Some(rx_buffers),
+        }
+    }
+
+    fn add_rx_buffers(&mut self, count: usize) {
+        *self.rx_buffers.as_mut().unwrap() += count;
     }
 }
 
@@ -267,11 +281,15 @@ impl Client for TestClient {
     }
 
     fn recv(&mut self, data: &[u8], _checksum: &ChecksumState) {
+        if let Some(rx_buffers) = &mut self.rx_buffers {
+            assert_ne!(*rx_buffers, 0, "packet sent without an RX buffer");
+            *rx_buffers -= 1;
+        }
         self.received_packets.lock().push(data.to_vec());
     }
 
     fn rx_mtu(&mut self) -> usize {
-        1514
+        if self.rx_buffers == Some(0) { 0 } else { 1514 }
     }
 }
 
@@ -1114,6 +1132,323 @@ async fn test_tcp_bind_port_forward(driver: DefaultDriver) {
     let (_, _, tcp) = parse_tcp_packet(syn_pkt);
     assert_eq!(tcp.dst_port, guest_port);
     assert_eq!(tcp.control, TcpControl::Syn);
+}
+
+/// Test that an accepted connection sends its initial SYN after RX capacity
+/// becomes available.
+#[pal_async::async_test]
+async fn test_tcp_port_forward_defers_initial_syn_without_rx_buffer(driver: DefaultDriver) {
+    let mut consomme = Consomme::new(ConsommeParams::new().unwrap());
+    let mut client = TestClient::with_rx_buffers(driver.clone(), 0);
+
+    let guest_port = 7777;
+    let received = client.received_packets.clone();
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    socket
+        .bind(&SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+        .unwrap();
+    let host_addr = socket.local_addr().unwrap().as_socket().unwrap();
+
+    consomme
+        .access(&mut client)
+        .bind_tcp_port(socket, guest_port)
+        .expect("bind should succeed");
+
+    let connector = std::net::TcpStream::connect(host_addr).unwrap();
+    connector.set_nonblocking(true).unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        std::future::poll_fn(|cx| {
+            consomme.access(&mut client).poll(cx);
+            Poll::Ready(())
+        })
+        .await;
+
+        if !consomme.tcp.connections.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for forwarded TCP connection"
+        );
+        pal_async::timer::PolledTimer::new(&driver)
+            .sleep(Duration::from_millis(10))
+            .await;
+    }
+
+    assert!(
+        received.lock().is_empty(),
+        "SYN should wait for an RX buffer"
+    );
+
+    client.add_rx_buffers(1);
+    std::future::poll_fn(|cx| {
+        consomme.access(&mut client).poll(cx);
+        Poll::Ready(())
+    })
+    .await;
+
+    let syn_packet = {
+        let packets = received.lock();
+        packets
+            .iter()
+            .find(|packet| {
+                TcpTestHarness::is_tcp_packet(packet)
+                    .is_some_and(|tcp| tcp.control == TcpControl::Syn && tcp.dst_port == guest_port)
+            })
+            .cloned()
+            .expect("initial SYN should be sent when an RX buffer is available")
+    };
+    let (_, _, syn) = parse_tcp_packet(&syn_packet);
+    assert!(syn.ack_number.is_none());
+
+    let connection = consomme.tcp.connections.values_mut().next().unwrap();
+    assert!(connection.inner.handshake_deadline.is_some());
+    connection.inner.handshake_deadline = Some(TimerInstant::now() - Duration::from_millis(1));
+    std::future::poll_fn(|cx| {
+        consomme.access(&mut client).poll(cx);
+        Poll::Ready(())
+    })
+    .await;
+    assert!(
+        consomme.tcp.connections.is_empty(),
+        "expired handshake should be reclaimed"
+    );
+}
+
+/// Test that a stale ACK from a recently closed guest connection resets the
+/// stale tuple and retransmits the outstanding SYN once an RX buffer is ready.
+#[pal_async::async_test]
+async fn test_tcp_port_forward_recovers_from_stale_ack(driver: DefaultDriver) {
+    let mut consomme = Consomme::new(ConsommeParams::new().unwrap());
+    let mut client = TestClient::with_rx_buffers(driver.clone(), 1);
+
+    let guest_mac = consomme.params_mut().client_mac;
+    let gateway_mac = consomme.params_mut().gateway_mac;
+    let guest_ip = consomme.params_mut().client_ip;
+    let guest_port = 7777;
+    let received = client.received_packets.clone();
+
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    socket
+        .bind(&SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+        .unwrap();
+    let host_addr = socket.local_addr().unwrap().as_socket().unwrap();
+
+    consomme
+        .access(&mut client)
+        .bind_tcp_port(socket, guest_port)
+        .expect("bind should succeed");
+
+    let connector = std::net::TcpStream::connect(host_addr).unwrap();
+    connector.set_nonblocking(true).unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let syn_packet = loop {
+        std::future::poll_fn(|cx| {
+            consomme.access(&mut client).poll(cx);
+            Poll::Ready(())
+        })
+        .await;
+
+        if let Some(packet) = received.lock().iter().find_map(|packet| {
+            TcpTestHarness::is_tcp_packet(packet)
+                .is_some_and(|tcp| tcp.control == TcpControl::Syn && tcp.dst_port == guest_port)
+                .then(|| packet.clone())
+        }) {
+            break packet;
+        }
+
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for forwarded TCP SYN"
+        );
+        pal_async::timer::PolledTimer::new(&driver)
+            .sleep(Duration::from_millis(10))
+            .await;
+    };
+
+    let (syn_src_ip, _, syn) = parse_tcp_packet(&syn_packet);
+    let ft = FourTuple {
+        src: SocketAddr::V4(SocketAddrV4::new(guest_ip, guest_port)),
+        dst: SocketAddr::V4(SocketAddrV4::new(syn_src_ip, syn.src_port)),
+    };
+    let initial_rto = consomme
+        .tcp
+        .connections
+        .get(&ft)
+        .unwrap()
+        .inner
+        .retransmission
+        .rto;
+    received.lock().clear();
+    client.add_rx_buffers(2);
+
+    let stale_ack = TcpRepr {
+        src_port: guest_port,
+        dst_port: syn.src_port,
+        control: TcpControl::None,
+        seq_number: TcpSeqNumber(9000),
+        ack_number: Some(syn.seq_number),
+        window_len: 64240,
+        window_scale: None,
+        max_seg_size: None,
+        sack_permitted: false,
+        sack_ranges: [None, None, None],
+        timestamp: None,
+        payload: &[],
+    };
+    let mut buf = vec![0u8; 1514];
+    let len = build_tcp_packet(
+        &mut buf,
+        guest_mac,
+        gateway_mac,
+        guest_ip,
+        syn_src_ip,
+        &stale_ack,
+    );
+    consomme
+        .access(&mut client)
+        .send(&buf[..len], &ChecksumState::NONE)
+        .unwrap();
+
+    let immediate_retry_syn = {
+        let packets = received.lock();
+        let (_, _, rst) = parse_tcp_packet(
+            packets
+                .iter()
+                .find(|packet| {
+                    TcpTestHarness::is_tcp_packet(packet)
+                        .is_some_and(|tcp| tcp.control == TcpControl::Rst)
+                })
+                .expect("stale connection should be reset"),
+        );
+        assert_eq!(rst.seq_number, syn.seq_number);
+        packets
+            .iter()
+            .find(|packet| {
+                TcpTestHarness::is_tcp_packet(packet)
+                    .is_some_and(|tcp| tcp.control == TcpControl::Syn)
+            })
+            .cloned()
+            .expect("SYN should be retransmitted immediately")
+    };
+    let (_, _, immediate_retry_syn) = parse_tcp_packet(&immediate_retry_syn);
+    assert_eq!(immediate_retry_syn.seq_number, syn.seq_number);
+    assert_eq!(
+        consomme
+            .tcp
+            .connections
+            .get(&ft)
+            .unwrap()
+            .inner
+            .retransmission
+            .rto,
+        initial_rto,
+        "guest-triggered retransmission must not back off the RTO"
+    );
+    assert!(
+        !consomme
+            .tcp
+            .connections
+            .get(&ft)
+            .unwrap()
+            .inner
+            .retransmission
+            .syn_retransmitted,
+        "guest-triggered retransmission must not arm the SYN RTO floor"
+    );
+
+    received.lock().clear();
+    client.add_rx_buffers(1);
+    consomme
+        .access(&mut client)
+        .send(&buf[..len], &ChecksumState::NONE)
+        .unwrap();
+    assert!(
+        !received.lock().iter().any(|packet| {
+            TcpTestHarness::is_tcp_packet(packet).is_some_and(|tcp| tcp.control == TcpControl::Syn)
+        }),
+        "retry should wait for an RX buffer"
+    );
+
+    client.add_rx_buffers(1);
+    consomme
+        .tcp
+        .connections
+        .get_mut(&ft)
+        .unwrap()
+        .inner
+        .retransmission
+        .deadline = Some(TimerInstant::now());
+    std::future::poll_fn(|cx| {
+        consomme.access(&mut client).poll(cx);
+        Poll::Ready(())
+    })
+    .await;
+
+    let retry_syn_packet = received
+        .lock()
+        .iter()
+        .find(|packet| {
+            TcpTestHarness::is_tcp_packet(packet).is_some_and(|tcp| tcp.control == TcpControl::Syn)
+        })
+        .cloned()
+        .expect("outstanding SYN should be retransmitted");
+    let (_, _, retry_syn) = parse_tcp_packet(&retry_syn_packet);
+    assert_eq!(retry_syn.seq_number, syn.seq_number);
+    assert!(retry_syn.ack_number.is_none());
+
+    client.add_rx_buffers(1);
+    let syn_ack = TcpRepr {
+        src_port: guest_port,
+        dst_port: retry_syn.src_port,
+        control: TcpControl::Syn,
+        seq_number: TcpSeqNumber(10000),
+        ack_number: Some(retry_syn.seq_number + 1),
+        window_len: 64240,
+        window_scale: Some(7),
+        max_seg_size: Some(1460),
+        sack_permitted: false,
+        sack_ranges: [None, None, None],
+        timestamp: None,
+        payload: &[],
+    };
+    let len = build_tcp_packet(
+        &mut buf,
+        guest_mac,
+        gateway_mac,
+        guest_ip,
+        syn_src_ip,
+        &syn_ack,
+    );
+    consomme
+        .access(&mut client)
+        .send(&buf[..len], &ChecksumState::NONE)
+        .unwrap();
+
+    assert_eq!(
+        consomme
+            .tcp
+            .connections
+            .get(&ft)
+            .expect("connection should remain active")
+            .inner
+            .state,
+        TcpState::Established
+    );
+    assert!(
+        consomme
+            .tcp
+            .connections
+            .get(&ft)
+            .unwrap()
+            .inner
+            .handshake_deadline
+            .is_none(),
+        "completed handshake should clear its deadline"
+    );
 }
 
 /// Test that when a loopback connection is forwarded to the guest, the source
@@ -2574,6 +2909,15 @@ fn test_retransmission_state_follows_rfc_6298() {
     assert_eq!(state.rto, Duration::from_millis(5875));
 
     state.on_send(TcpSeqNumber(3), start + Duration::from_secs(3));
+    let rto_before_early_retransmit = state.rto;
+    state.on_early_retransmit(start + Duration::from_secs(4));
+    assert_eq!(state.rto, rto_before_early_retransmit);
+    assert_eq!(
+        state.deadline,
+        Some(start + Duration::from_secs(4) + rto_before_early_retransmit)
+    );
+    assert!(state.sample.is_none());
+
     state.on_retransmit(start + Duration::from_secs(9));
     assert_eq!(state.rto, Duration::from_millis(11750));
     assert!(
